@@ -3,4 +3,13 @@ dist/
 android/build/
 android/compiled_res/
 .gradle/
+local.properties
 .DS_Store
+*.keystore
+*.idsig
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+npm-debug.log*

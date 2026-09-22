@@ -4,9 +4,9 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 
 // Single-file build: everything (JS, CSS, images) is inlined into dist/index.html.
 // This is required for the Android WebView shell, which loads the app from
-// file:///android_asset — ES module scripts are CORS-blocked over file://,
-// so a multi-file Vite build renders a blank screen. Single file = no
-// subresource fetches = no CORS problem, and it keeps the app fully offline.
+// file:///android_asset. ES module scripts are CORS-blocked over file://,
+// so a multi-file Vite build renders a blank screen. Single file means no
+// subresource fetches and no CORS problem, and the app stays fully offline.
 export default defineConfig({
   plugins: [react(), viteSingleFile()],
   base: "./",
