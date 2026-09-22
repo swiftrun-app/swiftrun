@@ -1,52 +1,49 @@
-import { useState } from "react";
 import { CITIES } from "../data.js";
 
 const SUPPORT_PHONE = "72173308";
+const ROLE_LABEL = { customer: "Sender", runner: "Runner", admin: "Admin" };
 
-export default function Profile({ profile, onSaveProfile }) {
-  const [name, setName] = useState(profile.name || "");
-  const [phone, setPhone] = useState(profile.phone || "");
-  const [saved, setSaved] = useState(false);
-
-  const save = () => {
-    onSaveProfile({ name: name.trim(), phone: phone.trim() });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  };
-
-  const initial = (name.trim()[0] || "🙂").toUpperCase();
+export default function Profile({ user, demoMode, onLogout }) {
+  const initial = ((user?.name || "?").trim()[0] || "?").toUpperCase();
 
   return (
     <div className="screen">
       <h2>Profile</h2>
-      <p className="sub">Your details stay on this device.</p>
+      <p className="sub">Your account and support.</p>
 
       <div className="card">
         <div className="profile-head">
-          <div className="avatar">{name.trim() ? initial : "🙂"}</div>
+          <div className="avatar">{initial}</div>
           <div>
-            <div style={{ fontWeight: 800, fontSize: 17 }}>{name.trim() || "SwiftRun user"}</div>
+            <div style={{ fontWeight: 800, fontSize: 17 }}>{user?.name || "SwiftRun user"}</div>
             <div style={{ fontSize: 13, color: "var(--muted)" }}>
-              {phone.trim() ? `+267 ${phone.trim()}` : "Add your number below"}
+              {user?.phone ? `+267 ${user.phone}` : "No number on file"}
+            </div>
+            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <span className="badge" style={{ background: "#eaf4ff", color: "#0a63c4" }}>
+                {ROLE_LABEL[user?.role] || user?.role}
+              </span>
+              {user?.role === "runner" && (
+                <span className={user?.verified ? "badge delivered" : "badge pending"}>
+                  {user?.verified ? "Verified" : "Unverified"}
+                </span>
+              )}
+              {demoMode && (
+                <span className="badge" style={{ background: "#f3f4f6", color: "#4b5563" }}>
+                  Demo mode
+                </span>
+              )}
             </div>
           </div>
         </div>
-        <div className="field">
-          <label>Your name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Thato M." maxLength={40} />
+        {demoMode && (
+          <div style={{ fontSize: 13, color: "var(--muted)", lineHeight: 1.6, marginTop: 4 }}>
+            Demo mode. The app is offline and your data is stored on this device only.
+          </div>
+        )}
+        <div style={{ marginTop: 12 }}>
+          <button className="btn ghost" onClick={onLogout}>Log out</button>
         </div>
-        <div className="field">
-          <label>Phone number</label>
-          <input
-            value={phone}
-            onChange={(e) => setPhone(e.target.value.replace(/[^\d]/g, "").slice(0, 8))}
-            placeholder="e.g. 71234567"
-            inputMode="numeric"
-          />
-        </div>
-        <button className="btn primary" onClick={save}>
-          {saved ? "Saved ✓" : "Save details"}
-        </button>
       </div>
 
       <div className="sec-row"><h3>Support</h3></div>
@@ -82,7 +79,7 @@ export default function Profile({ profile, onSaveProfile }) {
 
       <div className="sec-row"><h3>About</h3></div>
       <div className="card" style={{ fontSize: 13, color: "var(--muted)", lineHeight: 1.6 }}>
-        SwiftRun 2.0. The runner marketplace for Botswana. Book verified runners for errands,
+        SwiftRun 3.0. The runner marketplace for Botswana. Book verified runners for errands,
         food, groceries, documents and parcels. Works offline. Made in Gaborone.
       </div>
     </div>

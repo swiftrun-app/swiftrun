@@ -1,103 +1,99 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Sheet from "../components/Sheet.jsx";
+import { getBookings, cancelBooking } from "../api.js";
+import {
+  BookingCard, BookingDetail, EmptyState, ErrorState, Loading,
+  STATUS_LABEL, statusClass,
+} from "./common.jsx";
 
-const STATUS_LABEL = {
-  pending: "Pending",
-  accepted: "Accepted",
-  enroute: "En route",
-  delivered: "Delivered",
-  cancelled: "Cancelled",
-};
-
-const STATUS_ICON = {
-  pending: "⏳",
-  accepted: "✅",
-  enroute: "🛵",
-  delivered: "📦",
-  cancelled: "✕",
-};
-
-function fmtDate(ts) {
-  return new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-}
-
-export default function Bookings({ bookings, onCancel }) {
+export default function Bookings() {
+  const [bookings, setBookings] = useState(null);
+  const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
 
-  const active = bookings.filter((b) => b.status !== "delivered" && b.status !== "cancelled");
-  const past = bookings.filter((b) => b.status === "delivered" || b.status === "cancelled");
+  const load = useCallback(async () => {
+    setError("");
+    try {
+      setBookings(await getBookings());
+    } catch (e) {
+      if (e.message !== "SESSION_EXPIRED") setError(e.message || "Could not load bookings.");
+    }
+  }, []);
 
-  const renderRow = (b) => (
-    <div className="card clickable" key={b.id} onClick={() => { setSelected(b); setConfirming(false); }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{ fontSize: 26 }}>{STATUS_ICON[b.status] || "📦"}</div>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 700, fontSize: 14 }}>{b.serviceTitle}</div>
-          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
-            {b.runnerName} · {b.pickup} to {b.dropoff}
-          </div>
-        </div>
-        <div style={{ textAlign: "right" }}>
-          <span className={`badge ${b.status}`}>{STATUS_LABEL[b.status]}</span>
-          <div style={{ fontWeight: 800, marginTop: 4 }}>P{b.price}</div>
-        </div>
-      </div>
-    </div>
-  );
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const cancel = async () => {
+    if (!selected || busy) return;
+    setBusy(true);
+    try {
+      await cancelBooking(selected.id);
+      setSelected(null);
+      setConfirming(false);
+      await load();
+    } catch (e) {
+      if (e.message !== "SESSION_EXPIRED") setError(e.message || "Could not cancel this booking.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (bookings === null && !error) return <Loading label="Loading your bookings..." />;
+  if (error && bookings === null) return <div className="screen"><h2>Bookings</h2><ErrorState message={error} onRetry={load} /></div>;
+
+  const list = bookings || [];
+  const active = list.filter((b) => b.status === "pending" || b.status === "accepted" || b.status === "en_route");
+  const past = list.filter((b) => b.status === "delivered" || b.status === "cancelled");
 
   return (
     <div className="screen">
       <h2>Bookings</h2>
       <p className="sub">Track every run from request to delivery.</p>
 
-      {bookings.length === 0 && (
-        <div className="empty">
-          <div className="big">🧾</div>
-          <div>No bookings yet.</div>
-          <div style={{ fontSize: 13 }}>Find a runner on Home and book your first run.</div>
-        </div>
+      {error && <div className="err">{error}</div>}
+
+      {list.length === 0 && (
+        <EmptyState icon="🧾" title="No bookings yet." hint="Find a runner on Home and book your first run." />
       )}
 
       {active.length > 0 && (
         <>
           <div className="sec-row"><h3>Active</h3><span>{active.length}</span></div>
-          {active.map(renderRow)}
+          {active.map((b) => (
+            <BookingCard key={b.id} b={b} onOpen={() => { setSelected(b); setConfirming(false); }} />
+          ))}
         </>
       )}
 
       {past.length > 0 && (
         <>
           <div className="sec-row"><h3>History</h3><span>{past.length}</span></div>
-          {past.map(renderRow)}
+          {past.map((b) => (
+            <BookingCard key={b.id} b={b} onOpen={() => { setSelected(b); setConfirming(false); }} />
+          ))}
         </>
       )}
 
       {selected && (
         <Sheet onClose={() => setSelected(null)}>
-          <h3>{selected.serviceTitle}</h3>
-          <p className="sub">{selected.id} · {fmtDate(selected.createdAt)}</p>
+          <h3>{selected.service_title}</h3>
           <div style={{ display: "flex", gap: 8, margin: "8px 0 14px" }}>
-            <span className={`badge ${selected.status}`}>{STATUS_LABEL[selected.status]}</span>
-            <span className="badge" style={{ background: "#eaf4ff", color: "#0a63c4" }}>{selected.category}</span>
+            <span className={`badge ${statusClass(selected.status)}`}>{STATUS_LABEL[selected.status]}</span>
+            {selected.service_category && (
+              <span className="badge" style={{ background: "#eaf4ff", color: "#0a63c4" }}>{selected.service_category}</span>
+            )}
           </div>
-          <div style={{ fontSize: 14, lineHeight: 1.9 }}>
-            <div>🏃 <b>Runner:</b> {selected.runnerName}</div>
-            <div>📍 <b>From:</b> {selected.pickup}</div>
-            <div>🏁 <b>To:</b> {selected.dropoff}</div>
-            {selected.note && <div>📝 <b>Note:</b> {selected.note}</div>}
-            <div>💰 <b>Price:</b> P{selected.price} · pay on delivery</div>
-          </div>
+          <BookingDetail b={selected} />
           {(selected.status === "pending" || selected.status === "accepted") && (
             <div style={{ marginTop: 16 }}>
               {confirming ? (
                 <div className="btnrow">
-                  <button className="btn ghost" onClick={() => setConfirming(false)}>Keep it</button>
-                  <button
-                    className="btn danger-ghost"
-                    onClick={() => { onCancel(selected.id); setSelected(null); }}
-                  >
-                    Yes, cancel
+                  <button className="btn ghost" onClick={() => setConfirming(false)} disabled={busy}>Keep it</button>
+                  <button className="btn danger-ghost" onClick={cancel} disabled={busy}>
+                    {busy ? "Cancelling..." : "Yes, cancel"}
                   </button>
                 </div>
               ) : (

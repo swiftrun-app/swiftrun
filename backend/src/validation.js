@@ -39,6 +39,17 @@ export const bookingStatusSchema = z.object({
   status: z.enum(['accepted', 'en_route', 'delivered', 'cancelled']),
 });
 
+// Runner status advances: accepted -> en_route -> delivered (no skips, no cancels).
+export const bookingStatusAdvanceSchema = z.object({
+  status: z.enum(['en_route', 'delivered']),
+});
+
+export const adminUserUpdateSchema = z.object({
+  role: z.enum(['customer', 'runner', 'admin']).optional(),
+  verified: z.boolean().optional(),
+  suspended: z.boolean().optional(),
+});
+
 export const reviewCreateSchema = z.object({
   booking_id: z.number().int().positive(),
   rating: z.number().int().min(1).max(5),

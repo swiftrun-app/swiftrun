@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
   phone TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'customer' CHECK (role IN ('customer','runner','admin')),
+  suspended INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -94,5 +95,11 @@ CREATE INDEX IF NOT EXISTS idx_reviews_runner ON reviews(runner_id);
 `;
 
 db.exec(SCHEMA);
+
+// Safe migration for databases created before users.suspended existed.
+const userColumns = db.prepare('PRAGMA table_info(users)').all();
+if (!userColumns.some((col) => col.name === 'suspended')) {
+  db.exec('ALTER TABLE users ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0');
+}
 
 export default db;

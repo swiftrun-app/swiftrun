@@ -8,6 +8,21 @@ import db from './db.js';
 
 const RESET = process.argv.includes('--reset');
 
+const hash = (pw) => bcrypt.hashSync(pw, 10);
+
+// Idempotent admin account. Runs on every seed invocation, including when the
+// rest of the seed is skipped because users already exist.
+function ensureAdminUser() {
+  const existing = db.prepare('SELECT id FROM users WHERE phone = ?').get('72170001');
+  if (existing) {
+    console.log('  admin user already present: phone 72170001');
+    return;
+  }
+  db.prepare('INSERT INTO users (name, phone, password_hash, role) VALUES (?, ?, ?, ?)')
+    .run('SwiftRun Admin', '72170001', hash('admin1234'), 'admin');
+  console.log('  admin user created: phone 72170001 / password admin1234');
+}
+
 if (RESET) {
   console.log('Reset flag set: wiping all data.');
   db.exec('DELETE FROM reviews; DELETE FROM bookings; DELETE FROM services; DELETE FROM runners; DELETE FROM users; DELETE FROM zones;');
@@ -15,12 +30,13 @@ if (RESET) {
 } else {
   const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
   if (count > 0) {
+    ensureAdminUser();
     console.log(`Database already has ${count} user(s). Skipping seed (use --reset to reseed).`);
     process.exit(0);
   }
 }
 
-const hash = (pw) => bcrypt.hashSync(pw, 10);
+ensureAdminUser();
 
 // ---------- zones (Gaborone) ----------
 const ZONES = [

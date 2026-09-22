@@ -7,6 +7,7 @@ import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
+import { z } from 'zod';
 
 import db from './db.js';
 import { signToken, requireAuth, requireRole } from './auth.js';
@@ -15,6 +16,8 @@ import {
   loginSchema,
   bookingCreateSchema,
   bookingStatusSchema,
+  bookingStatusAdvanceSchema,
+  adminUserUpdateSchema,
   reviewCreateSchema,
   runnerQuerySchema,
   serviceQuerySchema,
@@ -100,9 +103,29 @@ function runnerIdForUser(userId) {
   return row ? row.id : null;
 }
 
+// Shared enriched booking SELECT: bookings + service title/category + runner
+// display name + customer name. Used by runner and admin endpoints too.
+const ENRICHED_BOOKING_SQL = `
+  SELECT b.*, s.title AS service_title, s.category AS service_category,
+         r.display_name AS runner_name, u.name AS customer_name
+  FROM bookings b
+  JOIN services s ON s.id = b.service_id
+  JOIN runners r ON r.id = b.runner_id
+  JOIN users u ON u.id = b.customer_id`;
+
+function adminSafeUser(row) {
+  if (!row) return null;
+  const user = { ...safeUser(row), suspended: Boolean(row.suspended) };
+  if (row.role === 'runner') {
+    const r = db.prepare('SELECT verified FROM runners WHERE user_id = ?').get(row.id);
+    user.verified = Boolean(r?.verified);
+  }
+  return user;
+}
+
 // ---------- routes ----------
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, version: '2.0.0', time: new Date().toISOString() });
+  res.json({ ok: true, version: '2.1.0', time: new Date().toISOString() });
 });
 
 // ----- auth -----
@@ -139,6 +162,9 @@ app.post('/api/auth/login', (req, res, next) => {
     const row = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
     if (!row || !bcrypt.compareSync(password, row.password_hash)) {
       throw new AppError(401, 'Invalid phone number or password.');
+    }
+    if (row.suspended) {
+      throw new AppError(401, 'Account suspended.');
     }
     const user = safeUser(row);
     res.json({ token: signToken(user), user });
@@ -271,22 +297,19 @@ app.post('/api/bookings', requireAuth, requireRole('customer'), (req, res, next)
 app.get('/api/bookings', requireAuth, (req, res, next) => {
   try {
     let rows;
-    const base = `
-      SELECT b.*, s.title AS service_title, s.category AS service_category,
-             r.display_name AS runner_name, u.name AS customer_name
-      FROM bookings b
-      JOIN services s ON s.id = b.service_id
-      JOIN runners r ON r.id = b.runner_id
-      JOIN users u ON u.id = b.customer_id`;
     if (req.user.role === 'customer') {
-      rows = db.prepare(`${base} WHERE b.customer_id = ? ORDER BY b.created_at DESC`).all(req.user.id);
+      rows = db
+        .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.customer_id = ? ORDER BY b.created_at DESC, b.id DESC`)
+        .all(req.user.id);
     } else if (req.user.role === 'runner') {
       const rid = runnerIdForUser(req.user.id);
       rows = rid
-        ? db.prepare(`${base} WHERE b.runner_id = ? ORDER BY b.created_at DESC`).all(rid)
+        ? db
+            .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`)
+            .all(rid)
         : [];
     } else {
-      rows = db.prepare(`${base} ORDER BY b.created_at DESC`).all();
+      rows = db.prepare(`${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`).all();
     }
     res.json({ bookings: rows });
   } catch (err) {
@@ -334,6 +357,121 @@ app.patch('/api/bookings/:id', requireAuth, (req, res, next) => {
     updateBooking();
 
     res.json({ booking: db.prepare('SELECT * FROM bookings WHERE id = ?').get(id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ----- runner job board -----
+// Pending bookings assigned to this runner (enriched shape).
+app.get('/api/jobs', requireAuth, requireRole('runner'), (req, res, next) => {
+  try {
+    const rid = runnerIdForUser(req.user.id);
+    if (!rid) throw new AppError(404, 'Runner profile not found.');
+    const jobs = db
+      .prepare(
+        `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? AND b.status = 'pending' ORDER BY b.created_at DESC, b.id DESC`
+      )
+      .all(rid);
+    res.json({ jobs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Accept a pending booking assigned to this runner.
+app.post('/api/bookings/:id/accept', requireAuth, requireRole('runner'), (req, res, next) => {
+  try {
+    const { id } = idParamSchema.parse(req.params);
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+    if (!booking) throw new AppError(404, 'Booking not found.');
+    const rid = runnerIdForUser(req.user.id);
+    if (booking.status !== 'pending' || !rid || booking.runner_id !== rid) {
+      throw new AppError(409, 'Only pending bookings assigned to you can be accepted.');
+    }
+    db.prepare("UPDATE bookings SET status = 'accepted', updated_at = datetime('now') WHERE id = ?").run(
+      id
+    );
+    res.json({ booking: db.prepare('SELECT * FROM bookings WHERE id = ?').get(id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Advance a booking: accepted -> en_route -> delivered (no skips).
+app.patch('/api/bookings/:id/status', requireAuth, requireRole('runner'), (req, res, next) => {
+  try {
+    const { id } = idParamSchema.parse(req.params);
+    const { status } = bookingStatusAdvanceSchema.parse(req.body);
+
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+    if (!booking) throw new AppError(404, 'Booking not found.');
+    const rid = runnerIdForUser(req.user.id);
+    if (!rid || booking.runner_id !== rid) {
+      throw new AppError(403, 'This booking is not assigned to you.');
+    }
+
+    const allowed = (TRANSITIONS.runner || {})[booking.status] || [];
+    if (!allowed.includes(status)) {
+      throw new AppError(409, `Cannot move booking from "${booking.status}" to "${status}" as runner.`);
+    }
+
+    const advanceBooking = db.transaction(() => {
+      db.prepare("UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?").run(
+        status,
+        id
+      );
+      if (status === 'delivered') {
+        db.prepare('UPDATE runners SET runs_completed = runs_completed + 1 WHERE id = ?').run(
+          booking.runner_id
+        );
+      }
+    });
+    advanceBooking();
+
+    res.json({ booking: db.prepare('SELECT * FROM bookings WHERE id = ?').get(id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// All bookings for this runner (enriched shape), newest first.
+app.get('/api/runner/jobs', requireAuth, requireRole('runner'), (req, res, next) => {
+  try {
+    const rid = runnerIdForUser(req.user.id);
+    const rows = rid
+      ? db
+          .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`)
+          .all(rid)
+      : [];
+    res.json({ bookings: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Earnings from delivered bookings for this runner.
+app.get('/api/runner/earnings', requireAuth, requireRole('runner'), (req, res, next) => {
+  try {
+    const rid = runnerIdForUser(req.user.id);
+    const rows = rid
+      ? db
+          .prepare(
+            `SELECT b.id AS booking_id, s.title AS service_title, b.price_pula,
+                    b.updated_at AS delivered_at
+             FROM bookings b
+             JOIN services s ON s.id = b.service_id
+             WHERE b.runner_id = ? AND b.status = 'delivered'
+             ORDER BY b.updated_at DESC, b.id DESC`
+          )
+          .all(rid)
+      : [];
+    const total = rows.reduce((sum, r) => sum + r.price_pula, 0);
+    res.json({
+      total_pula: Math.round(total * 100) / 100,
+      job_count: rows.length,
+      earnings: rows,
+    });
   } catch (err) {
     next(err);
   }
@@ -398,6 +536,130 @@ app.get('/api/zones', (req, res, next) => {
   try {
     const rows = db.prepare('SELECT * FROM zones ORDER BY demand DESC').all();
     res.json({ zones: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ----- admin -----
+const ADMIN_BOOKING_STATUSES = ['pending', 'accepted', 'en_route', 'delivered', 'cancelled'];
+
+app.get('/api/admin/stats', requireAuth, requireRole('admin'), (req, res, next) => {
+  try {
+    const users = db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN role = 'customer' THEN 1 ELSE 0 END) AS customers,
+                SUM(CASE WHEN role = 'runner' THEN 1 ELSE 0 END) AS runners,
+                SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admins
+         FROM users`
+      )
+      .get();
+    const statusRows = db.prepare('SELECT status, COUNT(*) AS c FROM bookings GROUP BY status').all();
+    const bookings_by_status = {
+      pending: 0,
+      accepted: 0,
+      en_route: 0,
+      delivered: 0,
+      cancelled: 0,
+    };
+    for (const r of statusRows) {
+      if (r.status in bookings_by_status) bookings_by_status[r.status] = r.c;
+    }
+    const total_revenue_pula = db
+      .prepare("SELECT COALESCE(SUM(price_pula), 0) AS total FROM bookings WHERE status = 'delivered'")
+      .get().total;
+    const pending_reviews = db.prepare('SELECT COUNT(*) AS c FROM reviews').get().c;
+    res.json({
+      users: {
+        total: users.total,
+        customers: users.customers || 0,
+        runners: users.runners || 0,
+        admins: users.admins || 0,
+      },
+      bookings_by_status,
+      total_revenue_pula,
+      pending_reviews,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/admin/users', requireAuth, requireRole('admin'), (req, res, next) => {
+  try {
+    const { role } = z
+      .object({ role: z.enum(['customer', 'runner', 'admin']).optional() })
+      .parse(req.query);
+    const rows = role
+      ? db.prepare('SELECT * FROM users WHERE role = ? ORDER BY created_at DESC, id DESC').all(role)
+      : db.prepare('SELECT * FROM users ORDER BY created_at DESC, id DESC').all();
+    res.json({ users: rows.map(adminSafeUser) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch('/api/admin/users/:id', requireAuth, requireRole('admin'), (req, res, next) => {
+  try {
+    const { id } = idParamSchema.parse(req.params);
+    const updates = adminUserUpdateSchema.parse(req.body);
+    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    if (!target) throw new AppError(404, 'User not found.');
+    const isSelf = target.id === req.user.id;
+    if (isSelf && updates.suspended === true) {
+      throw new AppError(403, 'You cannot suspend your own account.');
+    }
+    if (isSelf && updates.role && updates.role !== target.role) {
+      throw new AppError(403, 'You cannot change your own role.');
+    }
+
+    const applyUpdate = db.transaction(() => {
+      if (updates.role && updates.role !== target.role) {
+        db.prepare('UPDATE users SET role = ? WHERE id = ?').run(updates.role, id);
+        // Promoting to runner: create an unverified runner profile if none exists.
+        if (updates.role === 'runner') {
+          const hasProfile = db.prepare('SELECT id FROM runners WHERE user_id = ?').get(id);
+          if (!hasProfile) {
+            db.prepare(
+              `INSERT INTO runners (user_id, display_name, vehicle, zone, rating, runs_completed, verified)
+               VALUES (?, ?, 'car', 'CBD / Main Mall', 5.0, 0, 0)`
+            ).run(id, target.name);
+          }
+        }
+      }
+      if (typeof updates.suspended === 'boolean') {
+        db.prepare('UPDATE users SET suspended = ? WHERE id = ?').run(
+          updates.suspended ? 1 : 0,
+          id
+        );
+      }
+      if (typeof updates.verified === 'boolean') {
+        db.prepare('UPDATE runners SET verified = ? WHERE user_id = ?').run(
+          updates.verified ? 1 : 0,
+          id
+        );
+      }
+    });
+    applyUpdate();
+
+    res.json({ user: adminSafeUser(db.prepare('SELECT * FROM users WHERE id = ?').get(id)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/admin/bookings', requireAuth, requireRole('admin'), (req, res, next) => {
+  try {
+    const { status } = z
+      .object({ status: z.enum(ADMIN_BOOKING_STATUSES).optional() })
+      .parse(req.query);
+    const rows = status
+      ? db
+          .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.status = ? ORDER BY b.created_at DESC, b.id DESC`)
+          .all(status)
+      : db.prepare(`${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`).all();
+    res.json({ bookings: rows });
   } catch (err) {
     next(err);
   }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { CATEGORIES, RUNNERS, SERVICES, ZONES, REVIEWS } from "../data.js";
-import { getRunners, getServices } from "../api.js";
+import { getRunners, getServices, createBooking } from "../api.js";
 import Sheet from "../components/Sheet.jsx";
 
 // Keyword based offline price and time estimator. No network needed.
@@ -39,11 +39,14 @@ export default function Home({ onBook }) {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const r = await getRunners(RUNNERS);
-      const s = await getServices(SERVICES);
-      if (alive) {
-        setRunners(r);
-        setServices(s);
+      try {
+        const [r, s] = await Promise.all([getRunners(), getServices()]);
+        if (alive) {
+          setRunners(r);
+          setServices(s);
+        }
+      } catch {
+        // Demo data stays in place.
       }
     })();
     return () => {
@@ -206,22 +209,27 @@ function BookingForm({ service, runner, onClose, onConfirm }) {
   const [pickup, setPickup] = useState(ZONES[0].id);
   const [dropoff, setDropoff] = useState(ZONES[2].id);
   const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   const zoneName = (id) => (ZONES.find((z) => z.id === id) || {}).name || "";
 
-  const confirm = () => {
-    onConfirm({
-      id: "BK-" + Math.floor(1000 + Math.random() * 9000),
-      serviceTitle: service.title,
-      runnerName: runner.name,
-      category: service.category,
-      pickup: zoneName(pickup),
-      dropoff: zoneName(dropoff),
-      note: note.trim(),
-      price: service.price,
-      status: "pending",
-      createdAt: Date.now(),
-    });
+  const confirm = async () => {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const booking = await createBooking({
+        service_id: service.id,
+        pickup: zoneName(pickup),
+        dropoff: zoneName(dropoff),
+      });
+      onConfirm(booking);
+    } catch (e) {
+      if (e.message !== "SESSION_EXPIRED") setError(e.message || "Could not create the booking. Try again.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -248,9 +256,12 @@ function BookingForm({ service, runner, onClose, onConfirm }) {
         <label>Note for the runner (optional)</label>
         <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Gate code, landmarks, what to buy..." />
       </div>
+      {error && <div className="err">{error}</div>}
       <div style={{ marginTop: 12 }} className="btnrow">
-        <button className="btn ghost" onClick={onClose}>Back</button>
-        <button className="btn primary" onClick={confirm}>Confirm booking</button>
+        <button className="btn ghost" onClick={onClose} disabled={saving}>Back</button>
+        <button className="btn primary" onClick={confirm} disabled={saving}>
+          {saving ? "Booking..." : "Confirm booking"}
+        </button>
       </div>
     </Sheet>
   );
