@@ -1,7 +1,13 @@
-# SwiftRun APK build notes (v1.0, manual aapt2 build)
+# SwiftRun APK build notes (v1.1, manual aapt2 build)
 
 The sandbox blocks Gradle daemon TCP, so this release was built with the
-Android SDK build-tools directly (no Gradle):
+Android SDK build-tools directly (no Gradle). JDK used:
+`~/workspace/.jdk/jdk-17.0.20.1+1` (add its `bin/` to PATH for `javac`).
+
+IMPORTANT (v1.1 fix): the web app MUST be built as a single self-contained
+`index.html` (vite-plugin-singlefile, everything inlined). Android WebView
+CORS-blocks `<script type="module">` loaded from `file:///android_asset`,
+so a normal multi-file Vite build renders a blank screen. See `vite.config.js`.
 
 ```sh
 export ANDROID_HOME=~/workspace/.android-sdk
