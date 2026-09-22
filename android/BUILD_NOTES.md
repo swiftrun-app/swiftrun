@@ -57,7 +57,11 @@ $BT/apksigner verify --print-certs SwiftRun.apk
 
 v2.0 is signed with `release.keystore` at the repo root
 (SHA-256 cert fingerprint `cf3beba9d1f40438ffd16747fd753825bca84b76a4c88555c189fc67b7dce016`,
-package `bw.co.swiftrun`, versionCode 2, versionName 2.0).
+package `bw.co.swiftrun`). v3 shipped as versionCode 3 / 2.1 and v2.2 as
+versionCode 4, both with the same keystore, so they install over v2.0+ with
+no uninstall. v2.2 replaced the launcher icon with a full-bleed design
+(white runner on SwiftRun blue, no text), generated via the media pipeline
+and downscaled into all mipmap densities.
 The keystore is git-ignored and is NOT in the repo. Keep the file and its
 passwords safe: Android requires every future release of this app to be
 signed with the same keystore, or users cannot upgrade without uninstalling.
