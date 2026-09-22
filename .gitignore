@@ -13,3 +13,4 @@ local.properties
 *.db-wal
 *.db-shm
 npm-debug.log*
+build-tmp/
