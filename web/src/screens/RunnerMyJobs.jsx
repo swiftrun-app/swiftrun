@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Sheet from "../components/Sheet.jsx";
-import { getRunnerJobs, advanceBooking } from "../api.js";
+import { getRunnerJobs, advanceBooking, postRunnerLocation, runnerGoOffline, isDemo } from "../api.js";
 import {
   BookingCard, BookingDetail, EmptyState, ErrorState, Loading,
   STATUS_LABEL, statusClass,
@@ -10,6 +10,93 @@ const NEXT_ACTION = {
   accepted: { label: "Pick up", status: "en_route" },
   en_route: { label: "Deliver", status: "delivered" },
 };
+const LOCATION_INTERVAL_MS = 30000;
+
+function LocationToggle() {
+  const [sharing, setSharing] = useState(false);
+  const [locError, setLocError] = useState("");
+  const sharingRef = useRef(false);
+
+  useEffect(() => {
+    if (!sharing) return;
+    sharingRef.current = true;
+    let timer = null;
+
+    const post = () => {
+      if (!navigator.geolocation) {
+        setLocError("Location is not available on this device.");
+        setSharing(false);
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          if (!sharingRef.current) return;
+          try {
+            await postRunnerLocation(pos.coords.latitude, pos.coords.longitude);
+            setLocError("");
+          } catch {
+            // Keep the toggle on and retry on the next interval.
+          }
+        },
+        () => {
+          setLocError("Location access was denied. Turn it on in your browser or phone settings to share your live location.");
+          setSharing(false);
+        },
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 10000 }
+      );
+    };
+
+    post();
+    timer = setInterval(post, LOCATION_INTERVAL_MS);
+    return () => {
+      sharingRef.current = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [sharing]);
+
+  const toggle = async () => {
+    if (sharing) {
+      try {
+        await runnerGoOffline();
+      } catch {
+        // Offline flag is best-effort; the toggle still turns off locally.
+      }
+      setSharing(false);
+    } else {
+      setLocError("");
+      setSharing(true);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ fontSize: 26 }}>📡</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Share my live location</div>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
+            {sharing
+              ? "On. Customers and admin can see where you are while you work."
+              : "Off. Turn on so customers can follow your delivery."}
+          </div>
+        </div>
+        <button
+          className={sharing ? "btn primary sm" : "btn ghost sm"}
+          onClick={toggle}
+          aria-pressed={sharing}
+        >
+          {sharing ? "On" : "Off"}
+        </button>
+      </div>
+      {locError && <div className="err" style={{ marginTop: 8 }}>{locError}</div>}
+      {isDemo() && sharing && (
+        <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8 }}>
+          Demo mode. Your location is not actually sent anywhere.
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function RunnerMyJobs() {
   const [jobs, setJobs] = useState(null);
@@ -74,6 +161,8 @@ export default function RunnerMyJobs() {
 
       {error && <div className="err">{error}</div>}
 
+      <LocationToggle />
+
       {list.length === 0 && (
         <EmptyState icon="📦" title="No jobs yet." hint="Accept a job from the Jobs tab to get started." />
       )}
@@ -104,7 +193,7 @@ export default function RunnerMyJobs() {
           <div style={{ display: "flex", gap: 8, margin: "8px 0 14px" }}>
             <span className={`badge ${statusClass(selected.status)}`}>{STATUS_LABEL[selected.status]}</span>
           </div>
-          <BookingDetail b={selected} />
+          <BookingDetail b={selected} role="runner" />
           {renderAction(selected)}
         </Sheet>
       )}

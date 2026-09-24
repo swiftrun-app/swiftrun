@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS runners (
   rating REAL NOT NULL DEFAULT 5.0 CHECK (rating >= 0 AND rating <= 5),
   runs_completed INTEGER NOT NULL DEFAULT 0 CHECK (runs_completed >= 0),
   verified INTEGER NOT NULL DEFAULT 0,
+  lat REAL,
+  lng REAL,
+  location_updated_at TEXT,
+  is_online INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -75,3 +79,17 @@ CREATE INDEX IF NOT EXISTS idx_services_category ON services(category);
 CREATE INDEX IF NOT EXISTS idx_bookings_customer ON bookings(customer_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_runner ON bookings(runner_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_runner ON reviews(runner_id);
+
+CREATE TABLE IF NOT EXISTS queries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  message TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_queries_user ON queries(user_id);
+CREATE INDEX IF NOT EXISTS idx_queries_status ON queries(status);

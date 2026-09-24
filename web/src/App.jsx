@@ -12,6 +12,9 @@ import RunnerEarnings from "./screens/RunnerEarnings.jsx";
 import AdminOverview from "./screens/AdminOverview.jsx";
 import AdminUsers from "./screens/AdminUsers.jsx";
 import AdminBookings from "./screens/AdminBookings.jsx";
+import AdminQueries from "./screens/AdminQueries.jsx";
+import AdminLiveMap from "./screens/AdminLiveMap.jsx";
+import Help from "./screens/Help.jsx";
 import {
   apiReady, isDemo, onUnauthorized, currentUser, clearSession,
 } from "./api.js";
@@ -23,6 +26,7 @@ const TABS = {
     { id: "map", label: "Map", icon: "🗺️" },
     { id: "bookings", label: "Bookings", icon: "🧾" },
     { id: "activity", label: "Activity", icon: "🔔" },
+    { id: "help", label: "Help", icon: "❓" },
     { id: "profile", label: "Profile", icon: "👤" },
   ],
   runner: [
@@ -35,6 +39,8 @@ const TABS = {
     { id: "overview", label: "Overview", icon: "📊" },
     { id: "users", label: "Users", icon: "👥" },
     { id: "bookings", label: "Bookings", icon: "🧾" },
+    { id: "queries", label: "Queries", icon: "💬" },
+    { id: "livemap", label: "Map", icon: "🗺️" },
     { id: "profile", label: "Profile", icon: "👤" },
   ],
 };
@@ -169,6 +175,7 @@ export default function App() {
       {role === "customer" && tab === "activity" && (
         <Activity notifications={notifications} onReadAll={handleReadAll} />
       )}
+      {role === "customer" && tab === "help" && <Help />}
 
       {role === "runner" && tab === "jobs" && <RunnerJobs onAccepted={() => setTab("myjobs")} />}
       {role === "runner" && tab === "myjobs" && <RunnerMyJobs />}
@@ -177,6 +184,8 @@ export default function App() {
       {role === "admin" && tab === "overview" && <AdminOverview />}
       {role === "admin" && tab === "users" && <AdminUsers />}
       {role === "admin" && tab === "bookings" && <AdminBookings />}
+      {role === "admin" && tab === "queries" && <AdminQueries />}
+      {role === "admin" && tab === "livemap" && <AdminLiveMap />}
 
       {tab === "profile" && <Profile user={session} demoMode={demoMode} onLogout={logout} />}
 

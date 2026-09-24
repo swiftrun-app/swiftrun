@@ -1,5 +1,7 @@
-// SwiftRun API - Cloudflare Worker port of the Express backend (v2.1.0).
-// D1 binding: DB. Secret: JWT_SECRET.
+// SwiftRun API - Cloudflare Worker port of the Express backend (v2.2.0).
+// D1 binding: DB. Secrets: JWT_SECRET. Optional: MAILCHANNELS_API_KEY
+// (outbound email for support queries; without it, queries are stored and
+// visible in the admin inbox, and no email is sent).
 // All inputs validated (mirrors backend/src/validation.js). All SQL parameterized.
 
 import bcrypt from 'bcryptjs';
@@ -144,6 +146,31 @@ function vId(idStr) {
   if (!Number.isInteger(id) || id <= 0) return fail(['id: Invalid id.']);
   return { ok: true, value: id };
 }
+function vQuery(b) {
+  const d = [];
+  const subject = typeof b?.subject === 'string' ? b.subject.trim() : '';
+  if (!subject) d.push('subject: Subject is required.');
+  else if (subject.length > 120) d.push('subject: Subject is too long.');
+  const message = typeof b?.message === 'string' ? b.message.trim() : '';
+  if (!message) d.push('message: Message is required.');
+  else if (message.length > 2000) d.push('message: Message is too long.');
+  if (d.length) return fail(d);
+  return { ok: true, value: { subject, message } };
+}
+function vLocation(b) {
+  if (b && b.offline === true) return { ok: true, value: { offline: true } };
+  const d = [];
+  const lat = b?.lat;
+  const lng = b?.lng;
+  if (typeof lat !== 'number' || Number.isNaN(lat) || lat < -90 || lat > 90) {
+    d.push('lat: Must be a number between -90 and 90.');
+  }
+  if (typeof lng !== 'number' || Number.isNaN(lng) || lng < -180 || lng > 180) {
+    d.push('lng: Must be a number between -180 and 180.');
+  }
+  if (d.length) return fail(d);
+  return { ok: true, value: { lat, lng } };
+}
 
 // ---------- D1 helpers ----------
 async function qAll(db, sql, params = []) {
@@ -201,13 +228,59 @@ async function runnerIdForUser(db, userId) {
   return row ? row.id : null;
 }
 
+// Outbound email for new support queries via MailChannels. Requires the
+// MAILCHANNELS_API_KEY secret to be set on the worker. Without it this is a
+// deliberate no-op: the query is still stored and visible in the admin inbox.
+// Never throws; callers must not let a mail failure break the request.
+async function notifyNewQuery(env, q) {
+  const apiKey = env.MAILCHANNELS_API_KEY;
+  if (!apiKey) return { emailed: false, reason: 'missing-mailchannels-api-key' };
+  const resp = await fetch('https://api.mailchannels.net/tx/v1/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKey },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: 'support@swiftrun.online', name: 'SwiftRun Support' }] }],
+      from: { email: 'support@swiftrun.online', name: 'SwiftRun' },
+      subject: `[SwiftRun Query #${q.id}] ${q.subject}`,
+      content: [
+        {
+          type: 'text/plain',
+          value:
+            `New support query from ${q.name} (+267 ${q.phone}).\n\n` +
+            `Subject: ${q.subject}\n\n${q.message}\n\n` +
+            `View and close it in the SwiftRun admin dashboard, Queries tab.`,
+        },
+      ],
+    }),
+  });
+  return { emailed: resp.ok, status: resp.status };
+}
+
 const ENRICHED_BOOKING_SQL = `
   SELECT b.*, s.title AS service_title, s.category AS service_category,
-         r.display_name AS runner_name, u.name AS customer_name
+         r.display_name AS runner_name, u.name AS customer_name,
+         ru.phone AS runner_phone, u.phone AS customer_phone,
+         r.lat AS runner_lat, r.lng AS runner_lng,
+         r.location_updated_at AS runner_location_updated_at,
+         r.is_online AS runner_is_online
   FROM bookings b
   JOIN services s ON s.id = b.service_id
   JOIN runners r ON r.id = b.runner_id
-  JOIN users u ON u.id = b.customer_id`;
+  JOIN users u ON u.id = b.customer_id
+  JOIN users ru ON ru.id = r.user_id`;
+
+// Phone numbers and live runner location are only attached to bookings that
+// have been accepted. Pending (unassigned) bookings never expose them.
+function stripSensitiveForPending(rows) {
+  return rows.map((b) => {
+    if (b.status !== 'pending') return b;
+    const {
+      runner_phone, customer_phone, runner_lat, runner_lng,
+      runner_location_updated_at, runner_is_online, ...rest
+    } = b;
+    return rest;
+  });
+}
 
 // ---------- main handler ----------
 async function handle(req, env) {
@@ -251,7 +324,7 @@ async function handle(req, env) {
 
   // ----- health -----
   if (method === 'GET' && path === '/api/health') {
-    return json({ ok: true, version: '2.1.0', time: new Date().toISOString() });
+    return json({ ok: true, version: '2.2.0', time: new Date().toISOString() });
   }
 
   // ----- auth -----
@@ -377,7 +450,7 @@ async function handle(req, env) {
     } else {
       rows = await qAll(db, `${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`);
     }
-    return json({ bookings: rows });
+    return json({ bookings: stripSensitiveForPending(rows) });
   }
 
   const bookPatchMatch = path.match(/^\/api\/bookings\/(\d+)$/);
@@ -423,7 +496,7 @@ async function handle(req, env) {
     const rid = await runnerIdForUser(db, a.user.id);
     if (!rid) return err(404, 'Runner profile not found.');
     const jobs = await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? AND b.status = 'pending' ORDER BY b.created_at DESC, b.id DESC`, [rid]);
-    return json({ jobs });
+    return json({ jobs: stripSensitiveForPending(jobs) });
   }
 
   const acceptMatch = path.match(/^\/api\/bookings\/(\d+)\/accept$/);
@@ -481,7 +554,7 @@ async function handle(req, env) {
     if (rg) return rg;
     const rid = await runnerIdForUser(db, a.user.id);
     const rows = rid ? await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`, [rid]) : [];
-    return json({ bookings: rows });
+    return json({ bookings: stripSensitiveForPending(rows) });
   }
 
   if (method === 'GET' && path === '/api/runner/earnings') {
@@ -666,7 +739,99 @@ async function handle(req, env) {
     const rows = status
       ? await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.status = ? ORDER BY b.created_at DESC, b.id DESC`, [status])
       : await qAll(db, `${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`);
-    return json({ bookings: rows });
+    return json({ bookings: stripSensitiveForPending(rows) });
+  }
+
+  // ----- support queries -----
+  if (method === 'POST' && path === '/api/queries') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const v = vQuery(body);
+    if (!v.ok) return validationErr(v.details);
+    const me = await qOne(db, 'SELECT name, phone FROM users WHERE id = ?', [a.user.id]);
+    if (!me) return err(401, 'Authentication required.');
+    const ins = await db.prepare(
+      'INSERT INTO queries (user_id, name, phone, subject, message) VALUES (?, ?, ?, ?, ?)'
+    ).bind(a.user.id, me.name, me.phone, v.value.subject, v.value.message).run();
+    const saved = await qOne(db, 'SELECT * FROM queries WHERE id = ?', [ins.meta.last_row_id]);
+    let emailed = false;
+    try {
+      emailed = (await notifyNewQuery(env, saved)).emailed;
+    } catch {
+      emailed = false;
+    }
+    return json({ query: saved, email_notified: emailed }, 201);
+  }
+
+  if (method === 'GET' && path === '/api/queries') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    if (a.user.role === 'admin') {
+      const status = url.searchParams.get('status');
+      if (status && !['open', 'closed'].includes(status)) {
+        return validationErr(['status: Invalid status.']);
+      }
+      const rows = status
+        ? await qAll(db, 'SELECT * FROM queries WHERE status = ? ORDER BY created_at DESC, id DESC', [status])
+        : await qAll(db, 'SELECT * FROM queries ORDER BY created_at DESC, id DESC');
+      return json({ queries: rows });
+    }
+    const rows = await qAll(db, 'SELECT * FROM queries WHERE user_id = ? ORDER BY created_at DESC, id DESC', [a.user.id]);
+    return json({ queries: rows });
+  }
+
+  const queryPatchMatch = path.match(/^\/api\/queries\/(\d+)$/);
+  if (method === 'PATCH' && queryPatchMatch) {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const v = vId(queryPatchMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const status = body?.status;
+    if (!['open', 'closed'].includes(status)) {
+      return validationErr(['status: Must be open or closed.']);
+    }
+    const existing = await qOne(db, 'SELECT * FROM queries WHERE id = ?', [v.value]);
+    if (!existing) return err(404, 'Query not found.');
+    await db.prepare('UPDATE queries SET status = ? WHERE id = ?').bind(status, v.value).run();
+    const updated = await qOne(db, 'SELECT * FROM queries WHERE id = ?', [v.value]);
+    return json({ query: updated });
+  }
+
+  // ----- runner live location -----
+  if (method === 'POST' && path === '/api/runner/location') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const rid = await runnerIdForUser(db, a.user.id);
+    if (!rid) return err(404, 'Runner profile not found.');
+    const v = vLocation(body);
+    if (!v.ok) return validationErr(v.details);
+    if (v.value.offline) {
+      await db.prepare('UPDATE runners SET is_online = 0 WHERE id = ?').bind(rid).run();
+    } else {
+      await db.prepare(
+        "UPDATE runners SET lat = ?, lng = ?, location_updated_at = datetime('now'), is_online = 1 WHERE id = ?"
+      ).bind(v.value.lat, v.value.lng, rid).run();
+    }
+    return json({ ok: true, online: !v.value.offline });
+  }
+
+  if (method === 'GET' && path === '/api/admin/runners/live') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const rows = await qAll(db, `
+      SELECT r.id, r.display_name, r.vehicle, r.zone, r.lat, r.lng,
+             r.location_updated_at, u.phone AS phone
+      FROM runners r JOIN users u ON u.id = r.user_id
+      WHERE r.is_online = 1 AND r.lat IS NOT NULL AND r.lng IS NOT NULL
+        AND r.location_updated_at >= datetime('now', '-5 minutes')
+      ORDER BY r.location_updated_at DESC`);
+    return json({ runners: rows });
   }
 
   return err(404, 'Not found.');

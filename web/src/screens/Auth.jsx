@@ -5,6 +5,11 @@ import { isDemo, login, register } from "../api.js";
 const DEMO_HINT =
   "Demo logins: 72170000 / demo1234 (sender), 72111111 / runner1234 (runner), 72170001 / admin1234 (admin).";
 
+// The APK download link only makes sense on the website, not inside the app itself.
+const SHOW_APK_LINK =
+  typeof window !== "undefined" &&
+  (window.location.protocol === "http:" || window.location.protocol === "https:");
+
 export default function Auth({ onAuth }) {
   const [mode, setMode] = useState("login"); // login | signup
   const [name, setName] = useState("");
@@ -131,6 +136,20 @@ export default function Auth({ onAuth }) {
         </button>
 
         {isDemo() && <div className="demo-hint">{DEMO_HINT}</div>}
+
+        {SHOW_APK_LINK && (
+          <div style={{ textAlign: "center", marginTop: 14 }}>
+            <a
+              href="/SwiftRun.apk"
+              style={{ fontSize: 13, fontWeight: 700, color: "var(--accent, #0a63c4)", textDecoration: "none" }}
+            >
+              ⬇️ Download the Android app
+            </a>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+              Prefer the app over the website? Get SwiftRun for Android.
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

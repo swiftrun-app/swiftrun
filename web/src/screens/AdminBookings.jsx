@@ -64,7 +64,7 @@ export default function AdminBookings() {
           <div style={{ display: "flex", gap: 8, margin: "8px 0 14px" }}>
             <span className={`badge ${statusClass(selected.status)}`}>{STATUS_LABEL[selected.status]}</span>
           </div>
-          <BookingDetail b={selected} />
+          <BookingDetail b={selected} role="admin" />
         </Sheet>
       )}
     </div>

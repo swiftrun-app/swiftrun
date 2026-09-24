@@ -86,7 +86,7 @@ export default function Bookings() {
               <span className="badge" style={{ background: "#eaf4ff", color: "#0a63c4" }}>{selected.service_category}</span>
             )}
           </div>
-          <BookingDetail b={selected} />
+          <BookingDetail b={selected} role="customer" />
           {(selected.status === "pending" || selected.status === "accepted") && (
             <div style={{ marginTop: 16 }}>
               {confirming ? (

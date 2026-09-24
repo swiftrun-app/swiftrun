@@ -3,6 +3,11 @@ import { CITIES } from "../data.js";
 const SUPPORT_PHONE = "72173308";
 const ROLE_LABEL = { customer: "Sender", runner: "Runner", admin: "Admin" };
 
+// The APK download link only makes sense on the website, not inside the app itself.
+const SHOW_APK_LINK =
+  typeof window !== "undefined" &&
+  (window.location.protocol === "http:" || window.location.protocol === "https:");
+
 export default function Profile({ user, demoMode, onLogout }) {
   const initial = ((user?.name || "?").trim()[0] || "?").toUpperCase();
 
@@ -82,6 +87,23 @@ export default function Profile({ user, demoMode, onLogout }) {
         SwiftRun 3.0. The runner marketplace for Botswana. Book verified runners for errands,
         food, groceries, documents and parcels. Works offline. Made in Gaborone.
       </div>
+
+      {SHOW_APK_LINK && (
+        <>
+          <div className="sec-row"><h3>Android app</h3></div>
+          <div className="card">
+            <div style={{ fontSize: 14, fontWeight: 700 }}>SwiftRun for Android</div>
+            <div style={{ fontSize: 13, color: "var(--muted)", marginTop: 4, lineHeight: 1.6 }}>
+              Download the app and keep it on your phone. No need to visit the website.
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <a href="/SwiftRun.apk" style={{ textDecoration: "none" }}>
+                <button className="btn primary" style={{ pointerEvents: "none" }}>⬇️ Download SwiftRun.apk</button>
+              </a>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

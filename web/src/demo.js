@@ -6,6 +6,7 @@ import { SERVICES } from "./data.js";
 
 const USERS_KEY = "sr_demo_users";
 const BOOKINGS_KEY = "sr_demo_bookings";
+const QUERIES_KEY = "sr_demo_queries";
 const SEQ_KEY = "sr_demo_seq";
 const DAY = 86400000;
 
@@ -123,6 +124,7 @@ export function demoReset() {
   try {
     localStorage.removeItem(USERS_KEY);
     localStorage.removeItem(BOOKINGS_KEY);
+    localStorage.removeItem(QUERIES_KEY);
     localStorage.removeItem(SEQ_KEY);
   } catch {
     // ignore
@@ -180,9 +182,28 @@ export function demoCreateBooking(customer, service_id, pickup, dropoff) {
 
 export function demoGetBookings(user) {
   const all = bookings();
-  if (user.role === "admin") return all;
-  if (user.role === "runner") return all.filter((b) => b.runner_id === user.id);
-  return all.filter((b) => b.customer_id === user.id);
+  const list = user.role === "admin" ? all
+    : user.role === "runner" ? all.filter((b) => b.runner_id === user.id)
+    : all.filter((b) => b.customer_id === user.id);
+  return withPhones(list);
+}
+
+// Phone numbers ride along on bookings that have been accepted, mirroring
+// the live API. Pending bookings never expose them.
+function withPhones(list) {
+  const all = users();
+  const phoneOf = (id) => {
+    const u = all.find((x) => x.id === id);
+    return u ? u.phone : null;
+  };
+  return list.map((b) => {
+    if (b.status === "pending") return b;
+    return {
+      ...b,
+      runner_phone: b.runner_id ? phoneOf(b.runner_id) : null,
+      customer_phone: phoneOf(b.customer_id),
+    };
+  });
 }
 
 export function demoRunnerJobs() {
@@ -295,6 +316,66 @@ export function demoUpdateUser(id, patch) {
 }
 
 export function demoAdminBookings(status) {
-  const all = bookings();
+  const all = withPhones(bookings());
   return status ? all.filter((b) => b.status === status) : all;
+}
+
+// ---------- Support queries (demo) ----------
+
+function demoQueries() {
+  let q = read(QUERIES_KEY, null);
+  if (!q) {
+    q = [];
+    write(QUERIES_KEY, q);
+  }
+  return q;
+}
+
+export function demoSubmitQuery(user, subject, message) {
+  const s = String(subject || "").trim();
+  const m = String(message || "").trim();
+  if (!s) return { error: "Please add a subject." };
+  if (!m) return { error: "Please write your message." };
+  const q = {
+    id: "Q" + Date.now(),
+    user_id: user.id, name: user.name, phone: user.phone,
+    subject: s.slice(0, 120), message: m.slice(0, 2000),
+    status: "open", created_at: Date.now(),
+  };
+  const all = demoQueries();
+  all.unshift(q);
+  write(QUERIES_KEY, all);
+  return { query: q };
+}
+
+export function demoGetQueries(user) {
+  return demoQueries().filter((q) => q.user_id === user.id);
+}
+
+export function demoAdminQueries(status) {
+  const all = demoQueries();
+  return status ? all.filter((q) => q.status === status) : all;
+}
+
+export function demoUpdateQuery(id, status) {
+  if (status !== "open" && status !== "closed") return { error: "Invalid status." };
+  const all = demoQueries();
+  const q = all.find((x) => x.id === id);
+  if (!q) return { error: "Query not found." };
+  q.status = status;
+  write(QUERIES_KEY, all);
+  return { query: q };
+}
+
+// ---------- Live runners (demo) ----------
+
+export function demoLiveRunners() {
+  return [
+    {
+      id: "u_runner", display_name: "Portia S.", vehicle: "Honda Fit",
+      zone: "CBD / Main Mall", phone: "72111111",
+      lat: -24.6282, lng: 25.9231,
+      location_updated_at: new Date(Date.now() - 60000).toISOString(),
+    },
+  ];
 }

@@ -274,6 +274,79 @@ export async function getRunnerEarnings() {
   return authFetch("/api/runner/earnings");
 }
 
+// ---------- Support queries ----------
+
+export async function submitQuery(subject, message) {
+  await apiReady();
+  const user = currentUser();
+  if (demoMode) {
+    if (!user) throw new Error("Please log in first.");
+    return okOrThrow(demo.demoSubmitQuery(user, subject, message), "query");
+  }
+  const r = await authFetch("/api/queries", {
+    method: "POST",
+    body: JSON.stringify({ subject, message }),
+  });
+  const q = unwrap(r, "query");
+  if (!q) throw new Error("Could not send your query. Try again.");
+  return q;
+}
+
+export async function getMyQueries() {
+  await apiReady();
+  const user = currentUser();
+  if (demoMode) return user ? demo.demoGetQueries(user) : [];
+  const r = await authFetch("/api/queries");
+  return unwrap(r, "queries") || [];
+}
+
+export async function adminQueries(status = "") {
+  await apiReady();
+  if (demoMode) return demo.demoAdminQueries(status);
+  const q = status ? `?status=${encodeURIComponent(status)}` : "";
+  const r = await authFetch(`/api/queries${q}`);
+  return unwrap(r, "queries") || [];
+}
+
+export async function adminUpdateQuery(id, status) {
+  await apiReady();
+  if (demoMode) return okOrThrow(demo.demoUpdateQuery(id, status), "query");
+  const r = await authFetch(`/api/queries/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ status }),
+  });
+  const q = unwrap(r, "query");
+  if (!q) throw new Error("Could not update this query.");
+  return q;
+}
+
+// ---------- Runner live location ----------
+
+export async function postRunnerLocation(lat, lng) {
+  await apiReady();
+  if (demoMode) return { ok: true, online: true };
+  return authFetch("/api/runner/location", {
+    method: "POST",
+    body: JSON.stringify({ lat, lng }),
+  });
+}
+
+export async function runnerGoOffline() {
+  await apiReady();
+  if (demoMode) return { ok: true, online: false };
+  return authFetch("/api/runner/location", {
+    method: "POST",
+    body: JSON.stringify({ offline: true }),
+  });
+}
+
+export async function getLiveRunners() {
+  await apiReady();
+  if (demoMode) return demo.demoLiveRunners();
+  const r = await authFetch("/api/admin/runners/live");
+  return unwrap(r, "runners") || [];
+}
+
 // ---------- Admin ----------
 
 export async function adminStats() {
