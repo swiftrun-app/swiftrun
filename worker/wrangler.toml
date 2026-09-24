@@ -1,0 +1,12 @@
+name = "swiftrun-api"
+main = "src/index.js"
+compatibility_date = "2026-09-24"
+
+[vars]
+CORS_ORIGIN = "*"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "swiftrun"
+# PLACEHOLDER: fill in the real database id after `wrangler d1 create swiftrun`.
+database_id = "93f1801c-22d6-4afe-b6bd-0dd69fa83570"

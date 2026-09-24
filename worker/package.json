@@ -1,0 +1,1 @@
+{"dependencies":{"bcryptjs":"^2.4.3","hono":"^4.7.0","zod":"^3.24.0"},"description":"SwiftRun v2 API ported to Cloudflare Workers (Hono + D1).","devDependencies":{"wrangler":"^4.0.0"},"name":"swiftrun-worker","private":true,"scripts":{"deploy":"wrangler deploy","dev":"wrangler dev --local"},"type":"module","version":"2.1.0"}

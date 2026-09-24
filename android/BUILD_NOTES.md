@@ -62,6 +62,10 @@ versionCode 4, both with the same keystore, so they install over v2.0+ with
 no uninstall. v2.2 replaced the launcher icon with a full-bleed design
 (white runner on SwiftRun blue, no text), generated via the media pipeline
 and downscaled into all mipmap densities.
+v2.2.1 (versionCode 5) replaced the launcher icon again, this time with the
+official SwiftRun brand mark supplied by the user: the runner emblem (runner
+with parcel, speed lines, clock circle) cropped tightly from the brand logo,
+full-bleed on white, no wordmark text (unreadable at icon size).
 The keystore is git-ignored and is NOT in the repo. Keep the file and its
 passwords safe: Android requires every future release of this app to be
 signed with the same keystore, or users cannot upgrade without uninstalling.
@@ -69,6 +73,13 @@ signed with the same keystore, or users cannot upgrade without uninstalling.
 Earlier v1.x builds used the standard Android debug keystore
 (`~/.android-debug.keystore`); the v2.0 APK has a different signature, so
 the old v1 install must be uninstalled before installing v2.0.
+
+v2.3 (versionCode 6) is the domain-launch build: the web app was rebuilt
+with `VITE_API_URL=https://api.swiftrun.online`, pointing the APK at the
+live Cloudflare Worker + D1 backend (worker `swiftrun-api`, D1 database
+`swiftrun`, JWT auth, same demo seed data) instead of the local demo
+server. The build itself follows the same manual aapt2 flow above with the
+same release keystore, so it installs over v2.0+ with no uninstall.
 
 Never commit a keystore, its password, or the `.idsig` sidecar that
 apksigner writes next to the APK (`*.idsig` is in `.gitignore`).
