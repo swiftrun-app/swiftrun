@@ -84,7 +84,7 @@ export default function Profile({ user, demoMode, onLogout }) {
 
       <div className="sec-row"><h3>About</h3></div>
       <div className="card" style={{ fontSize: 13, color: "var(--muted)", lineHeight: 1.6 }}>
-        SwiftRun 3.0. The runner marketplace for Botswana. Book verified runners for errands,
+        SwiftRun. The runner marketplace for Botswana. Book verified runners for errands,
         food, groceries, documents and parcels. Works offline. Made in Gaborone.
       </div>
 
