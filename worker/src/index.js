@@ -1,117 +1,179 @@
-// SwiftRun v2 - Cloudflare Worker API (Hono + D1).
-// Ported from backend/src/server.js (Express + better-sqlite3).
-// Prices in Pula (P). All inputs validated with zod. All SQL via bound
-// parameters. One statement per prepare().bind() call; multi-statement
-// transactions use env.DB.batch([...]).
+// SwiftRun API - Cloudflare Worker port of the Express backend (v2.1.0).
+// D1 binding: DB. Secret: JWT_SECRET.
+// All inputs validated (mirrors backend/src/validation.js). All SQL parameterized.
 
-import { Hono } from 'hono';
-import { sign, verify } from 'hono/jwt';
 import bcrypt from 'bcryptjs';
-import { z } from 'zod';
 
-// ---------- zod validation schemas (copied from backend/src/validation.js) ----------
-// Botswana mobile numbers: 7 or 8 digits, starting with 7 (e.g. 72123456).
-const phoneSchema = z
-  .string()
-  .trim()
-  .regex(/^7\d{6,7}$/, 'Phone must be a Botswana mobile number: 7 or 8 digits starting with 7.');
+// bcryptjs cannot always detect a random source inside a bundle, so hand it
+// WebCrypto explicitly. Works in Workers and in Node.
+try {
+  bcrypt.setRandomFallback((len) =>
+    Array.from(globalThis.crypto.getRandomValues(new Uint8Array(len)))
+  );
+} catch {
+  // ignore; native detection will be used
+}
 
-const nameSchema = z.string().trim().min(1, 'Name is required.').max(100);
+const JWT_EXPIRY_S = 24 * 3600;
 
-const registerSchema = z.object({
-  name: nameSchema,
-  phone: phoneSchema,
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128),
-  role: z.enum(['customer', 'runner']).default('customer'),
-});
+// ---------- base64url ----------
+function b64urlEncode(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let bin = '';
+  for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(str) {
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
 
-const loginSchema = z.object({
-  phone: phoneSchema,
-  password: z.string().min(1, 'Password is required.'),
-});
-
-const bookingCreateSchema = z.object({
-  service_id: z.number().int().positive(),
-  pickup: z.string().trim().min(1, 'Pickup location is required.').max(200),
-  dropoff: z.string().trim().min(1, 'Dropoff location is required.').max(200),
-  scheduled_for: z
-    .string()
-    .trim()
-    .optional()
-    .refine((v) => v === undefined || v === '' || !Number.isNaN(Date.parse(v)), {
-      message: 'scheduled_for must be a valid ISO date string.',
-    }),
-});
-
-const bookingStatusSchema = z.object({
-  status: z.enum(['accepted', 'en_route', 'delivered', 'cancelled']),
-});
-
-// Runner status advances: accepted -> en_route -> delivered (no skips, no cancels).
-const bookingStatusAdvanceSchema = z.object({
-  status: z.enum(['en_route', 'delivered']),
-});
-
-const adminUserUpdateSchema = z.object({
-  role: z.enum(['customer', 'runner', 'admin']).optional(),
-  verified: z.boolean().optional(),
-  suspended: z.boolean().optional(),
-});
-
-const reviewCreateSchema = z.object({
-  booking_id: z.number().int().positive(),
-  rating: z.number().int().min(1).max(5),
-  comment: z.string().trim().max(500).default(''),
-});
-
-const runnerQuerySchema = z.object({
-  zone: z.string().trim().max(100).optional(),
-  min_rating: z.coerce.number().min(0).max(5).optional(),
-});
-
-const serviceQuerySchema = z.object({
-  category: z.enum(['errands', 'food', 'groceries', 'documents', 'parcels', 'shopping']).optional(),
-  zone: z.string().trim().max(100).optional(),
-  q: z.string().trim().max(100).optional(),
-});
-
-const idParamSchema = z.object({
-  id: z.coerce.number().int().positive(),
-});
-
-// ---------- helpers ----------
-class AppError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
+// ---------- JWT (HS256 via WebCrypto) ----------
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  );
+}
+async function signToken(user, secret) {
+  const header = b64urlEncode(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const body = b64urlEncode(
+    new TextEncoder().encode(
+      JSON.stringify({
+        id: user.id,
+        name: user.name,
+        phone: user.phone,
+        role: user.role,
+        exp: Math.floor(Date.now() / 1000) + JWT_EXPIRY_S,
+      })
+    )
+  );
+  const sig = await crypto.subtle.sign(
+    'HMAC',
+    await hmacKey(secret),
+    new TextEncoder().encode(`${header}.${body}`)
+  );
+  return `${header}.${body}.${b64urlEncode(sig)}`;
+}
+async function verifyToken(token, secret) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts;
+  let sigBytes;
+  try {
+    sigBytes = b64urlDecode(s);
+  } catch {
+    return null;
   }
-}
-
-function getSecret(env) {
-  if (env.JWT_SECRET) return env.JWT_SECRET;
-  // Local/dev fallback only. Production sets JWT_SECRET via `wrangler secret put`.
-  return 'dev-only-secret-do-not-use-in-production';
-}
-
-function safeUser(row) {
-  if (!row) return null;
-  return { id: row.id, name: row.name, phone: row.phone, role: row.role, created_at: row.created_at };
-}
-
-function adminSafeUser(row, verified) {
-  if (!row) return null;
-  const user = { ...safeUser(row), suspended: Boolean(row.suspended) };
-  if (row.role === 'runner') {
-    user.verified = Boolean(verified);
+  const ok = await crypto.subtle.verify(
+    'HMAC',
+    await hmacKey(secret),
+    sigBytes,
+    new TextEncoder().encode(`${h}.${p}`)
+  );
+  if (!ok) return null;
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlDecode(p)));
+  } catch {
+    return null;
   }
-  return user;
+  if (!payload || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+  return payload;
 }
 
-// Status machine: which role may move a booking from -> to.
-//   pending -> accepted | cancelled
-//   accepted -> en_route | cancelled
-//   en_route -> delivered
-//   delivered, cancelled are terminal.
+// ---------- validation (mirrors validation.js) ----------
+const PHONE_RE = /^7\d{6,7}$/;
+const CATEGORIES = ['errands', 'food', 'groceries', 'documents', 'parcels', 'shopping'];
+const ROLES = ['customer', 'runner', 'admin'];
+const BOOKING_STATUSES = ['pending', 'accepted', 'en_route', 'delivered', 'cancelled'];
+
+function fail(details) {
+  return { ok: false, details };
+}
+function vRegister(b) {
+  const d = [];
+  const name = typeof b?.name === 'string' ? b.name.trim() : '';
+  if (!name) d.push('name: Name is required.');
+  else if (name.length > 100) d.push('name: Name is too long.');
+  const phone = typeof b?.phone === 'string' ? b.phone.trim() : '';
+  if (!PHONE_RE.test(phone)) d.push('phone: Phone must be a Botswana mobile number: 7 or 8 digits starting with 7.');
+  const pw = b?.password;
+  if (typeof pw !== 'string' || pw.length < 6) d.push('password: Password must be at least 6 characters.');
+  else if (pw.length > 128) d.push('password: Password is too long.');
+  let role = b?.role;
+  if (role === undefined) role = 'customer';
+  if (!['customer', 'runner'].includes(role)) d.push('role: Invalid role.');
+  if (d.length) return fail(d);
+  return { ok: true, value: { name, phone, password: pw, role } };
+}
+function vLogin(b) {
+  const d = [];
+  const phone = typeof b?.phone === 'string' ? b.phone.trim() : '';
+  if (!PHONE_RE.test(phone)) d.push('phone: Phone must be a Botswana mobile number: 7 or 8 digits starting with 7.');
+  if (typeof b?.password !== 'string' || !b.password.length) d.push('password: Password is required.');
+  if (d.length) return fail(d);
+  return { ok: true, value: { phone, password: b.password } };
+}
+function vBookingCreate(b) {
+  const d = [];
+  if (!Number.isInteger(b?.service_id) || b.service_id <= 0) d.push('service_id: Must be a positive integer.');
+  const pickup = typeof b?.pickup === 'string' ? b.pickup.trim() : '';
+  const dropoff = typeof b?.dropoff === 'string' ? b.dropoff.trim() : '';
+  if (!pickup) d.push('pickup: Pickup location is required.');
+  else if (pickup.length > 200) d.push('pickup: Too long.');
+  if (!dropoff) d.push('dropoff: Dropoff location is required.');
+  else if (dropoff.length > 200) d.push('dropoff: Too long.');
+  let scheduled_for;
+  const sf = b?.scheduled_for;
+  if (sf !== undefined && sf !== null && String(sf).trim() !== '') {
+    if (Number.isNaN(Date.parse(String(sf).trim()))) d.push('scheduled_for: scheduled_for must be a valid ISO date string.');
+    else scheduled_for = String(sf).trim();
+  }
+  if (d.length) return fail(d);
+  return { ok: true, value: { service_id: b.service_id, pickup, dropoff, scheduled_for } };
+}
+function vId(idStr) {
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id <= 0) return fail(['id: Invalid id.']);
+  return { ok: true, value: id };
+}
+
+// ---------- D1 helpers ----------
+async function qAll(db, sql, params = []) {
+  const r = await db.prepare(sql).bind(...params).all();
+  return r.results || [];
+}
+async function qOne(db, sql, params = []) {
+  return db.prepare(sql).bind(...params).first();
+}
+
+// ---------- response helpers ----------
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS },
+  });
+}
+function err(status, message) {
+  return json({ error: message }, status);
+}
+function validationErr(details) {
+  return json({ error: 'Validation failed.', details }, 400);
+}
+
+// ---------- domain logic ----------
 const TRANSITIONS = {
   customer: { pending: ['cancelled'], accepted: ['cancelled'] },
   runner: { pending: ['accepted'], accepted: ['en_route'], en_route: ['delivered'] },
@@ -124,8 +186,21 @@ const TRANSITIONS = {
   },
 };
 
-// Shared enriched booking SELECT: bookings + service title/category + runner
-// display name + customer name.
+function safeUser(row) {
+  if (!row) return null;
+  return { id: row.id, name: row.name, phone: row.phone, role: row.role, created_at: row.created_at };
+}
+function adminSafeUser(row, verified) {
+  if (!row) return null;
+  const user = { ...safeUser(row), suspended: Boolean(row.suspended) };
+  if (row.role === 'runner') user.verified = Boolean(verified);
+  return user;
+}
+async function runnerIdForUser(db, userId) {
+  const row = await qOne(db, 'SELECT id FROM runners WHERE user_id = ?', [userId]);
+  return row ? row.id : null;
+}
+
 const ENRICHED_BOOKING_SQL = `
   SELECT b.*, s.title AS service_title, s.category AS service_category,
          r.display_name AS runner_name, u.name AS customer_name
@@ -134,653 +209,476 @@ const ENRICHED_BOOKING_SQL = `
   JOIN runners r ON r.id = b.runner_id
   JOIN users u ON u.id = b.customer_id`;
 
-async function runnerIdForUser(db, userId) {
-  const row = await db.prepare('SELECT id FROM runners WHERE user_id = ?').bind(userId).first();
-  return row ? row.id : null;
-}
+// ---------- main handler ----------
+async function handle(req, env) {
+  const url = new URL(req.url);
+  const method = req.method.toUpperCase();
+  const path = url.pathname;
 
-async function signToken(env, user) {
-  return sign(
-    {
-      id: user.id,
-      name: user.name,
-      phone: user.phone,
-      role: user.role,
-      exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
-    },
-    getSecret(env),
-    'HS256'
-  );
-}
-
-// 100kb JSON body limit (mirrors express.json({ limit: '100kb' })).
-async function parseJsonBody(c) {
-  const raw = await c.req.text();
-  if (new TextEncoder().encode(raw).length > 100 * 1024) {
-    throw new AppError(400, 'Invalid request body.');
-  }
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new AppError(400, 'Invalid request body.');
-  }
-}
-
-// ---------- app ----------
-const app = new Hono();
-
-// CORS: allow origin from env (default *), methods GET/POST/PATCH/OPTIONS.
-app.use('*', async (c, next) => {
-  const origin = c.env.CORS_ORIGIN || '*';
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  };
-  if (c.req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
-  }
-  await next();
-  for (const [k, v] of Object.entries(corsHeaders)) c.header(k, v);
-});
-
-// In-memory sliding-window rate limiting (per IP).
-//   /api/auth/* : 20 per 15 min (stricter)
-//   other /api  : 300 per 15 min
-const buckets = new Map();
-function checkLimit(key, limit, windowMs) {
-  const now = Date.now();
-  let hits = buckets.get(key) || [];
-  hits = hits.filter((t) => now - t < windowMs);
-  if (hits.length >= limit) {
-    buckets.set(key, hits);
-    return false;
-  }
-  hits.push(now);
-  buckets.set(key, hits);
-  return true;
-}
-
-app.use('/api/*', async (c, next) => {
-  const pathname = new URL(c.req.url).pathname;
-  const isAuth = pathname.startsWith('/api/auth');
-  const ip =
-    c.req.header('cf-connecting-ip') ||
-    c.req.header('x-forwarded-for') ||
-    'unknown';
-  const key = `${isAuth ? 'auth' : 'api'}:${ip}`;
-  const ok = checkLimit(key, isAuth ? 20 : 300, 15 * 60 * 1000);
-  if (!ok) {
-    return c.json(
-      { error: isAuth ? 'Too many attempts. Please try again later.' : 'Too many requests. Please try again later.' },
-      429
-    );
-  }
-  await next();
-});
-
-// ---------- auth middleware ----------
-async function requireAuth(c, next) {
-  const header = c.req.header('authorization') || '';
-  const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token) {
-    return c.json({ error: 'Authentication required.' }, 401);
-  }
-  try {
-    const payload = await verify(token, getSecret(c.env), 'HS256');
-    c.set('user', payload);
-    await next();
-  } catch {
-    return c.json({ error: 'Invalid or expired token.' }, 401);
-  }
-}
-
-function requireRole(...roles) {
-  return async (c, next) => {
-    const user = c.get('user');
-    if (!user || !roles.includes(user.role)) {
-      return c.json({ error: 'You do not have permission for this action.' }, 403);
-    }
-    await next();
-  };
-}
-
-// ---------- routes ----------
-app.get('/api/health', (c) => {
-  return c.json({ ok: true, version: '2.1.0', time: new Date().toISOString() });
-});
-
-// ----- auth -----
-app.post('/api/auth/register', async (c) => {
-  const db = c.env.DB;
-  const { name, phone, password, role } = registerSchema.parse(await parseJsonBody(c));
-  const existing = await db.prepare('SELECT id FROM users WHERE phone = ?').bind(phone).first();
-  if (existing) throw new AppError(409, 'Phone number is already registered.');
-
-  const hash = bcrypt.hashSync(password, 10);
-  const info = await db
-    .prepare('INSERT INTO users (name, phone, password_hash, role) VALUES (?, ?, ?, ?)')
-    .bind(name, phone, hash, role)
-    .run();
-  const user = safeUser(
-    await db.prepare('SELECT * FROM users WHERE id = ?').bind(info.meta.last_row_id).first()
-  );
-
-  // Runners get a runner profile immediately (unverified until reviewed).
-  if (role === 'runner') {
-    await db
-      .prepare(
-        `INSERT INTO runners (user_id, display_name, vehicle, zone, rating, runs_completed, verified)
-         VALUES (?, ?, 'car', 'CBD / Main Mall', 5.0, 0, 0)`
-      )
-      .bind(user.id, name)
-      .run();
+  if (method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS });
   }
 
-  return c.json({ token: await signToken(c.env, user), user }, 201);
-});
+  const db = env.DB;
+  const secret = env.JWT_SECRET;
+  if (!secret) return err(500, 'Server misconfigured.');
 
-app.post('/api/auth/login', async (c) => {
-  const db = c.env.DB;
-  const { phone, password } = loginSchema.parse(await parseJsonBody(c));
-  const row = await db.prepare('SELECT * FROM users WHERE phone = ?').bind(phone).first();
-  if (!row || !bcrypt.compareSync(password, row.password_hash)) {
-    throw new AppError(401, 'Invalid phone number or password.');
-  }
-  if (row.suspended) {
-    throw new AppError(401, 'Account suspended.');
-  }
-  const user = safeUser(row);
-  return c.json({ token: await signToken(c.env, user), user });
-});
-
-// ----- runners -----
-app.get('/api/runners', async (c) => {
-  const db = c.env.DB;
-  const { zone, min_rating } = runnerQuerySchema.parse(c.req.query());
-  const conditions = [];
-  const params = [];
-  if (zone) {
-    conditions.push('r.zone = ?');
-    params.push(zone);
-  }
-  if (min_rating !== undefined) {
-    conditions.push('COALESCE(rev.avg_rating, r.rating) >= ?');
-    params.push(min_rating);
-  }
-  const rows = await db
-    .prepare(
-      `SELECT r.id, r.display_name, r.vehicle, r.zone,
-              COALESCE(rev.avg_rating, r.rating) AS avg_rating,
-              COALESCE(rev.review_count, 0) AS review_count,
-              r.runs_completed, r.verified, r.created_at
-       FROM runners r
-       LEFT JOIN (
-         SELECT runner_id, AVG(rating) AS avg_rating, COUNT(*) AS review_count
-         FROM reviews GROUP BY runner_id
-       ) rev ON rev.runner_id = r.id
-       ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
-       ORDER BY avg_rating DESC, r.runs_completed DESC`
-    )
-    .bind(...params)
-    .all();
-  return c.json({ runners: rows.results });
-});
-
-// ----- services -----
-app.get('/api/services', async (c) => {
-  const db = c.env.DB;
-  const { category, zone, q } = serviceQuerySchema.parse(c.req.query());
-  const conditions = ['s.active = 1'];
-  const params = [];
-  if (category) {
-    conditions.push('s.category = ?');
-    params.push(category);
-  }
-  if (zone) {
-    conditions.push('r.zone = ?');
-    params.push(zone);
-  }
-  if (q) {
-    conditions.push('(s.title LIKE ? OR s.description LIKE ?)');
-    params.push(`%${q}%`, `%${q}%`);
-  }
-  const rows = await db
-    .prepare(
-      `SELECT s.id, s.title, s.category, s.description, s.price_pula, s.unit, s.created_at,
-              r.id AS runner_id, r.display_name AS runner_name, r.zone AS runner_zone,
-              r.vehicle AS runner_vehicle, r.rating AS runner_rating, r.verified AS runner_verified
-       FROM services s
-       JOIN runners r ON r.id = s.runner_id
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY s.created_at DESC`
-    )
-    .bind(...params)
-    .all();
-  return c.json({ services: rows.results });
-});
-
-app.get('/api/services/:id', async (c) => {
-  const db = c.env.DB;
-  const { id } = idParamSchema.parse(c.req.param());
-  const row = await db
-    .prepare(
-      `SELECT s.id, s.title, s.category, s.description, s.price_pula, s.unit, s.active, s.created_at,
-              r.id AS runner_id, r.display_name AS runner_name, r.zone AS runner_zone,
-              r.vehicle AS runner_vehicle, r.rating AS runner_rating, r.verified AS runner_verified
-       FROM services s
-       JOIN runners r ON r.id = s.runner_id
-       WHERE s.id = ?`
-    )
-    .bind(id)
-    .first();
-  if (!row) throw new AppError(404, 'Service not found.');
-  return c.json({ service: row });
-});
-
-// ----- bookings -----
-app.post('/api/bookings', requireAuth, requireRole('customer'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { service_id, pickup, dropoff, scheduled_for } = bookingCreateSchema.parse(
-    await parseJsonBody(c)
-  );
-  const service = await db
-    .prepare('SELECT id, runner_id, price_pula, active FROM services WHERE id = ?')
-    .bind(service_id)
-    .first();
-  if (!service || !service.active) throw new AppError(404, 'Service not found or unavailable.');
-
-  const info = await db
-    .prepare(
-      `INSERT INTO bookings (customer_id, service_id, runner_id, pickup, dropoff, scheduled_for, price_pula, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
-    )
-    .bind(user.id, service.id, service.runner_id, pickup, dropoff, scheduled_for || null, service.price_pula)
-    .run();
-
-  const booking = await db
-    .prepare('SELECT * FROM bookings WHERE id = ?')
-    .bind(info.meta.last_row_id)
-    .first();
-  return c.json({ booking }, 201);
-});
-
-app.get('/api/bookings', requireAuth, async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  let rows;
-  if (user.role === 'customer') {
-    rows = await db
-      .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.customer_id = ? ORDER BY b.created_at DESC, b.id DESC`)
-      .bind(user.id)
-      .all();
-  } else if (user.role === 'runner') {
-    const rid = await runnerIdForUser(db, user.id);
-    rows = rid
-      ? await db
-          .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`)
-          .bind(rid)
-          .all()
-      : { results: [] };
-  } else {
-    rows = await db
-      .prepare(`${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`)
-      .all();
-  }
-  return c.json({ bookings: rows.results });
-});
-
-app.patch('/api/bookings/:id', requireAuth, async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { id } = idParamSchema.parse(c.req.param());
-  const { status } = bookingStatusSchema.parse(await parseJsonBody(c));
-
-  const booking = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  if (!booking) throw new AppError(404, 'Booking not found.');
-
-  // Ownership checks.
-  if (user.role === 'customer' && booking.customer_id !== user.id) {
-    throw new AppError(403, 'You can only change your own bookings.');
-  }
-  if (user.role === 'runner') {
-    const rid = await runnerIdForUser(db, user.id);
-    if (!rid || booking.runner_id !== rid) {
-      throw new AppError(403, 'This booking is not assigned to you.');
+  let body;
+  if (method === 'POST' || method === 'PATCH') {
+    try {
+      const text = await req.text();
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      return err(400, 'Invalid request body.');
     }
   }
 
-  const allowed = (TRANSITIONS[user.role] || {})[booking.status] || [];
-  if (!allowed.includes(status)) {
-    throw new AppError(
-      409,
-      `Cannot move booking from "${booking.status}" to "${status}" as ${user.role}.`
-    );
+  async function authUser() {
+    const header = req.headers.get('authorization') || '';
+    const [scheme, token] = header.split(' ');
+    if (scheme !== 'Bearer' || !token) return null;
+    return verifyToken(token, secret);
+  }
+  async function requireAuth() {
+    const user = await authUser();
+    if (!user) return { error: err(401, 'Authentication required.') };
+    return { user };
+  }
+  function requireRole(user, ...roles) {
+    if (!roles.includes(user.role)) return err(403, 'You do not have permission for this action.');
+    return null;
   }
 
-  const stmts = [
-    db.prepare("UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, id),
-  ];
-  if (status === 'delivered') {
-    stmts.push(
-      db.prepare('UPDATE runners SET runs_completed = runs_completed + 1 WHERE id = ?').bind(booking.runner_id)
-    );
-  }
-  await db.batch(stmts);
-
-  const updated = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  return c.json({ booking: updated });
-});
-
-// ----- runner job board -----
-// Pending bookings assigned to this runner (enriched shape).
-app.get('/api/jobs', requireAuth, requireRole('runner'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const rid = await runnerIdForUser(db, user.id);
-  if (!rid) throw new AppError(404, 'Runner profile not found.');
-  const jobs = await db
-    .prepare(
-      `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? AND b.status = 'pending' ORDER BY b.created_at DESC, b.id DESC`
-    )
-    .bind(rid)
-    .all();
-  return c.json({ jobs: jobs.results });
-});
-
-// Accept a pending booking assigned to this runner.
-app.post('/api/bookings/:id/accept', requireAuth, requireRole('runner'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { id } = idParamSchema.parse(c.req.param());
-  const booking = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  if (!booking) throw new AppError(404, 'Booking not found.');
-  const rid = await runnerIdForUser(db, user.id);
-  if (booking.status !== 'pending' || !rid || booking.runner_id !== rid) {
-    throw new AppError(409, 'Only pending bookings assigned to you can be accepted.');
-  }
-  await db
-    .prepare("UPDATE bookings SET status = 'accepted', updated_at = datetime('now') WHERE id = ?")
-    .bind(id)
-    .run();
-  const updated = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  return c.json({ booking: updated });
-});
-
-// Advance a booking: accepted -> en_route -> delivered (no skips).
-app.patch('/api/bookings/:id/status', requireAuth, requireRole('runner'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { id } = idParamSchema.parse(c.req.param());
-  const { status } = bookingStatusAdvanceSchema.parse(await parseJsonBody(c));
-
-  const booking = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  if (!booking) throw new AppError(404, 'Booking not found.');
-  const rid = await runnerIdForUser(db, user.id);
-  if (!rid || booking.runner_id !== rid) {
-    throw new AppError(403, 'This booking is not assigned to you.');
+  // ----- health -----
+  if (method === 'GET' && path === '/api/health') {
+    return json({ ok: true, version: '2.1.0', time: new Date().toISOString() });
   }
 
-  const allowed = (TRANSITIONS.runner || {})[booking.status] || [];
-  if (!allowed.includes(status)) {
-    throw new AppError(409, `Cannot move booking from "${booking.status}" to "${status}" as runner.`);
-  }
-
-  const stmts = [
-    db.prepare("UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, id),
-  ];
-  if (status === 'delivered') {
-    stmts.push(
-      db.prepare('UPDATE runners SET runs_completed = runs_completed + 1 WHERE id = ?').bind(booking.runner_id)
-    );
-  }
-  await db.batch(stmts);
-
-  const updated = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(id).first();
-  return c.json({ booking: updated });
-});
-
-// All bookings for this runner (enriched shape), newest first.
-app.get('/api/runner/jobs', requireAuth, requireRole('runner'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const rid = await runnerIdForUser(db, user.id);
-  const rows = rid
-    ? await db
-        .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`)
-        .bind(rid)
-        .all()
-    : { results: [] };
-  return c.json({ bookings: rows.results });
-});
-
-// Earnings from delivered bookings for this runner.
-app.get('/api/runner/earnings', requireAuth, requireRole('runner'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const rid = await runnerIdForUser(db, user.id);
-  const rows = rid
-    ? await db
-        .prepare(
-          `SELECT b.id AS booking_id, s.title AS service_title, b.price_pula,
-                  b.updated_at AS delivered_at
-           FROM bookings b
-           JOIN services s ON s.id = b.service_id
-           WHERE b.runner_id = ? AND b.status = 'delivered'
-           ORDER BY b.updated_at DESC, b.id DESC`
-        )
-        .bind(rid)
-        .all()
-    : { results: [] };
-  const total = rows.results.reduce((sum, r) => sum + r.price_pula, 0);
-  return c.json({
-    total_pula: Math.round(total * 100) / 100,
-    job_count: rows.results.length,
-    earnings: rows.results,
-  });
-});
-
-// ----- reviews -----
-app.post('/api/reviews', requireAuth, requireRole('customer'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { booking_id, rating, comment } = reviewCreateSchema.parse(await parseJsonBody(c));
-  const booking = await db.prepare('SELECT * FROM bookings WHERE id = ?').bind(booking_id).first();
-  if (!booking || booking.customer_id !== user.id) {
-    throw new AppError(404, 'Booking not found.');
-  }
-  if (booking.status !== 'delivered') {
-    throw new AppError(409, 'You can only review delivered bookings.');
-  }
-  const existing = await db.prepare('SELECT id FROM reviews WHERE booking_id = ?').bind(booking_id).first();
-  if (existing) throw new AppError(409, 'This booking already has a review.');
-
-  const results = await db.batch([
-    db
-      .prepare('INSERT INTO reviews (booking_id, reviewer_id, runner_id, rating, comment) VALUES (?, ?, ?, ?, ?)')
-      .bind(booking_id, user.id, booking.runner_id, rating, comment),
-    db.prepare('SELECT AVG(rating) AS avg_rating FROM reviews WHERE runner_id = ?').bind(booking.runner_id),
-  ]);
-  const reviewId = results[0].meta.last_row_id;
-  const agg = results[1].results[0];
-  await db
-    .prepare('UPDATE runners SET rating = ROUND(?, 1) WHERE id = ?')
-    .bind(agg.avg_rating, booking.runner_id)
-    .run();
-
-  const review = await db.prepare('SELECT * FROM reviews WHERE id = ?').bind(reviewId).first();
-  return c.json({ review }, 201);
-});
-
-// ----- leaderboard & zones -----
-app.get('/api/leaderboard', async (c) => {
-  const db = c.env.DB;
-  const rows = await db
-    .prepare(
-      `SELECT id, display_name, vehicle, zone, rating, runs_completed, verified,
-              ROUND(rating * runs_completed, 1) AS score
-       FROM runners
-       ORDER BY score DESC, rating DESC
-       LIMIT 10`
-    )
-    .all();
-  return c.json({ leaderboard: rows.results });
-});
-
-app.get('/api/zones', async (c) => {
-  const db = c.env.DB;
-  const rows = await db.prepare('SELECT * FROM zones ORDER BY demand DESC').all();
-  return c.json({ zones: rows.results });
-});
-
-// ----- admin -----
-const ADMIN_BOOKING_STATUSES = ['pending', 'accepted', 'en_route', 'delivered', 'cancelled'];
-
-app.get('/api/admin/stats', requireAuth, requireRole('admin'), async (c) => {
-  const db = c.env.DB;
-  const users = await db
-    .prepare(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN role = 'customer' THEN 1 ELSE 0 END) AS customers,
-              SUM(CASE WHEN role = 'runner' THEN 1 ELSE 0 END) AS runners,
-              SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admins
-       FROM users`
-    )
-    .first();
-  const statusRows = await db.prepare('SELECT status, COUNT(*) AS c FROM bookings GROUP BY status').all();
-  const bookings_by_status = {
-    pending: 0,
-    accepted: 0,
-    en_route: 0,
-    delivered: 0,
-    cancelled: 0,
-  };
-  for (const r of statusRows.results) {
-    if (r.status in bookings_by_status) bookings_by_status[r.status] = r.c;
-  }
-  const revenue = await db
-    .prepare("SELECT COALESCE(SUM(price_pula), 0) AS total FROM bookings WHERE status = 'delivered'")
-    .first();
-  const total_revenue_pula = revenue.total;
-  const pendingReviews = await db.prepare('SELECT COUNT(*) AS c FROM reviews').first();
-  const pending_reviews = pendingReviews.c;
-  return c.json({
-    users: {
-      total: users.total,
-      customers: users.customers || 0,
-      runners: users.runners || 0,
-      admins: users.admins || 0,
-    },
-    bookings_by_status,
-    total_revenue_pula,
-    pending_reviews,
-  });
-});
-
-app.get('/api/admin/users', requireAuth, requireRole('admin'), async (c) => {
-  const db = c.env.DB;
-  const { role } = z
-    .object({ role: z.enum(['customer', 'runner', 'admin']).optional() })
-    .parse(c.req.query());
-  const rows = role
-    ? await db.prepare('SELECT * FROM users WHERE role = ? ORDER BY created_at DESC, id DESC').bind(role).all()
-    : await db.prepare('SELECT * FROM users ORDER BY created_at DESC, id DESC').all();
-  const users = [];
-  for (const row of rows.results) {
-    let verified;
-    if (row.role === 'runner') {
-      const r = await db.prepare('SELECT verified FROM runners WHERE user_id = ?').bind(row.id).first();
-      verified = r ? r.verified : 0;
+  // ----- auth -----
+  if (method === 'POST' && path === '/api/auth/register') {
+    const v = vRegister(body);
+    if (!v.ok) return validationErr(v.details);
+    const { name, phone, password, role } = v.value;
+    const existing = await qOne(db, 'SELECT id FROM users WHERE phone = ?', [phone]);
+    if (existing) return err(409, 'Phone number is already registered.');
+    const hash = bcrypt.hashSync(password, 10);
+    const ins = await db.prepare('INSERT INTO users (name, phone, password_hash, role) VALUES (?, ?, ?, ?)').bind(name, phone, hash, role).run();
+    const userId = ins.meta.last_row_id;
+    if (role === 'runner') {
+      await db.prepare(`INSERT INTO runners (user_id, display_name, vehicle, zone, rating, runs_completed, verified) VALUES (?, ?, 'car', 'CBD / Main Mall', 5.0, 0, 0)`).bind(userId, name).run();
     }
-    users.push(adminSafeUser(row, verified));
-  }
-  return c.json({ users });
-});
-
-app.patch('/api/admin/users/:id', requireAuth, requireRole('admin'), async (c) => {
-  const db = c.env.DB;
-  const user = c.get('user');
-  const { id } = idParamSchema.parse(c.req.param());
-  const updates = adminUserUpdateSchema.parse(await parseJsonBody(c));
-  const target = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
-  if (!target) throw new AppError(404, 'User not found.');
-  const isSelf = target.id === user.id;
-  if (isSelf && updates.suspended === true) {
-    throw new AppError(403, 'You cannot suspend your own account.');
-  }
-  if (isSelf && updates.role && updates.role !== target.role) {
-    throw new AppError(403, 'You cannot change your own role.');
+    const user = safeUser(await qOne(db, 'SELECT * FROM users WHERE id = ?', [userId]));
+    return json({ token: await signToken(user, secret), user }, 201);
   }
 
-  const stmts = [];
-  if (updates.role && updates.role !== target.role) {
-    stmts.push(db.prepare('UPDATE users SET role = ? WHERE id = ?').bind(updates.role, id));
-    // Promoting to runner: create an unverified runner profile if none exists.
-    if (updates.role === 'runner') {
-      const hasProfile = await db.prepare('SELECT id FROM runners WHERE user_id = ?').bind(id).first();
-      if (!hasProfile) {
-        stmts.push(
-          db
-            .prepare(
-              `INSERT INTO runners (user_id, display_name, vehicle, zone, rating, runs_completed, verified)
-               VALUES (?, ?, 'car', 'CBD / Main Mall', 5.0, 0, 0)`
-            )
-            .bind(id, target.name)
-        );
+  if (method === 'POST' && path === '/api/auth/login') {
+    const v = vLogin(body);
+    if (!v.ok) return validationErr(v.details);
+    const { phone, password } = v.value;
+    const row = await qOne(db, 'SELECT * FROM users WHERE phone = ?', [phone]);
+    if (!row || !bcrypt.compareSync(password, row.password_hash)) {
+      return err(401, 'Invalid phone number or password.');
+    }
+    if (row.suspended) return err(401, 'Account suspended.');
+    const user = safeUser(row);
+    return json({ token: await signToken(user, secret), user });
+  }
+
+  // ----- runners -----
+  if (method === 'GET' && path === '/api/runners') {
+    const zone = url.searchParams.get('zone');
+    const minRatingRaw = url.searchParams.get('min_rating');
+    let minRating;
+    if (minRatingRaw !== null && minRatingRaw !== '') {
+      minRating = Number(minRatingRaw);
+      if (Number.isNaN(minRating) || minRating < 0 || minRating > 5) {
+        return validationErr(['min_rating: Must be a number between 0 and 5.']);
       }
     }
+    const conds = [];
+    const params = [];
+    if (zone) { conds.push('r.zone = ?'); params.push(zone); }
+    if (minRating !== undefined) { conds.push('COALESCE(rev.avg_rating, r.rating) >= ?'); params.push(minRating); }
+    const rows = await qAll(db, `
+      SELECT r.id, r.display_name, r.vehicle, r.zone,
+             COALESCE(rev.avg_rating, r.rating) AS avg_rating,
+             COALESCE(rev.review_count, 0) AS review_count,
+             r.runs_completed, r.verified, r.created_at
+      FROM runners r
+      LEFT JOIN (SELECT runner_id, AVG(rating) AS avg_rating, COUNT(*) AS review_count FROM reviews GROUP BY runner_id) rev ON rev.runner_id = r.id
+      ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''}
+      ORDER BY avg_rating DESC, r.runs_completed DESC`, params);
+    return json({ runners: rows });
   }
-  if (typeof updates.suspended === 'boolean') {
-    stmts.push(db.prepare('UPDATE users SET suspended = ? WHERE id = ?').bind(updates.suspended ? 1 : 0, id));
-  }
-  if (typeof updates.verified === 'boolean') {
-    stmts.push(
-      db.prepare('UPDATE runners SET verified = ? WHERE user_id = ?').bind(updates.verified ? 1 : 0, id)
-    );
-  }
-  if (stmts.length) await db.batch(stmts);
 
-  const updated = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
-  let verified;
-  if (updated.role === 'runner') {
-    const r = await db.prepare('SELECT verified FROM runners WHERE user_id = ?').bind(updated.id).first();
-    verified = r ? r.verified : 0;
+  // ----- services -----
+  if (method === 'GET' && path === '/api/services') {
+    const category = url.searchParams.get('category');
+    const zone = url.searchParams.get('zone');
+    const q = url.searchParams.get('q');
+    if (category && !CATEGORIES.includes(category)) return validationErr(['category: Invalid category.']);
+    const conds = ['s.active = 1'];
+    const params = [];
+    if (category) { conds.push('s.category = ?'); params.push(category); }
+    if (zone) { conds.push('r.zone = ?'); params.push(zone); }
+    if (q) { conds.push('(s.title LIKE ? OR s.description LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
+    const rows = await qAll(db, `
+      SELECT s.id, s.title, s.category, s.description, s.price_pula, s.unit, s.created_at,
+             r.id AS runner_id, r.display_name AS runner_name, r.zone AS runner_zone,
+             r.vehicle AS runner_vehicle, r.rating AS runner_rating, r.verified AS runner_verified
+      FROM services s JOIN runners r ON r.id = s.runner_id
+      WHERE ${conds.join(' AND ')}
+      ORDER BY s.created_at DESC`, params);
+    return json({ services: rows });
   }
-  return c.json({ user: adminSafeUser(updated, verified) });
-});
 
-app.get('/api/admin/bookings', requireAuth, requireRole('admin'), async (c) => {
-  const db = c.env.DB;
-  const { status } = z
-    .object({ status: z.enum(ADMIN_BOOKING_STATUSES).optional() })
-    .parse(c.req.query());
-  const rows = status
-    ? await db
-        .prepare(`${ENRICHED_BOOKING_SQL} WHERE b.status = ? ORDER BY b.created_at DESC, b.id DESC`)
-        .bind(status)
-        .all()
-    : await db.prepare(`${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`).all();
-  return c.json({ bookings: rows.results });
-});
-
-// ---------- 404 + error handling ----------
-app.notFound((c) => {
-  return c.json({ error: 'Not found.' }, 404);
-});
-
-// Central error handler. Never leaks stack traces to clients.
-app.onError((err, c) => {
-  if (err?.name === 'ZodError') {
-    const details = err.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`);
-    return c.json({ error: 'Validation failed.', details }, 400);
+  const svcMatch = path.match(/^\/api\/services\/(\d+)$/);
+  if (method === 'GET' && svcMatch) {
+    const v = vId(svcMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const row = await qOne(db, `
+      SELECT s.id, s.title, s.category, s.description, s.price_pula, s.unit, s.active, s.created_at,
+             r.id AS runner_id, r.display_name AS runner_name, r.zone AS runner_zone,
+             r.vehicle AS runner_vehicle, r.rating AS runner_rating, r.verified AS runner_verified
+      FROM services s JOIN runners r ON r.id = s.runner_id
+      WHERE s.id = ?`, [v.value]);
+    if (!row) return err(404, 'Service not found.');
+    return json({ service: row });
   }
-  if (err instanceof AppError) {
-    return c.json({ error: err.message }, err.status);
-  }
-  console.error('Unhandled error:', err);
-  return c.json({ error: 'Internal server error.' }, 500);
-});
 
-export default app;
+  // ----- bookings -----
+  if (method === 'POST' && path === '/api/bookings') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'customer');
+    if (rg) return rg;
+    const v = vBookingCreate(body);
+    if (!v.ok) return validationErr(v.details);
+    const { service_id, pickup, dropoff, scheduled_for } = v.value;
+    const service = await qOne(db, 'SELECT id, runner_id, price_pula, active FROM services WHERE id = ?', [service_id]);
+    if (!service || !service.active) return err(404, 'Service not found or unavailable.');
+    const ins = await db.prepare(
+      `INSERT INTO bookings (customer_id, service_id, runner_id, pickup, dropoff, scheduled_for, price_pula, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+    ).bind(a.user.id, service.id, service.runner_id, pickup, dropoff, scheduled_for || null, service.price_pula).run();
+    const booking = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [ins.meta.last_row_id]);
+    return json({ booking }, 201);
+  }
+
+  if (method === 'GET' && path === '/api/bookings') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    let rows;
+    if (a.user.role === 'customer') {
+      rows = await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.customer_id = ? ORDER BY b.created_at DESC, b.id DESC`, [a.user.id]);
+    } else if (a.user.role === 'runner') {
+      const rid = await runnerIdForUser(db, a.user.id);
+      rows = rid ? await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`, [rid]) : [];
+    } else {
+      rows = await qAll(db, `${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`);
+    }
+    return json({ bookings: rows });
+  }
+
+  const bookPatchMatch = path.match(/^\/api\/bookings\/(\d+)$/);
+  if (method === 'PATCH' && bookPatchMatch) {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const v = vId(bookPatchMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const status = body?.status;
+    const allowedStatuses = Object.values(TRANSITIONS[a.user.role] || {}).flat();
+    const uniqueAllowed = [...new Set([...allowedStatuses])];
+    if (!uniqueAllowed.includes(status)) {
+      return validationErr(['status: Invalid status for your role.']);
+    }
+    const booking = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    if (!booking) return err(404, 'Booking not found.');
+    if (a.user.role === 'customer' && booking.customer_id !== a.user.id) {
+      return err(403, 'You can only change your own bookings.');
+    }
+    if (a.user.role === 'runner') {
+      const rid = await runnerIdForUser(db, a.user.id);
+      if (!rid || booking.runner_id !== rid) return err(403, 'This booking is not assigned to you.');
+    }
+    const allowed = (TRANSITIONS[a.user.role] || {})[booking.status] || [];
+    if (!allowed.includes(status)) {
+      return err(409, `Cannot move booking from "${booking.status}" to "${status}" as ${a.user.role}.`);
+    }
+    const stmts = [db.prepare("UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, v.value)];
+    if (status === 'delivered') {
+      stmts.push(db.prepare('UPDATE runners SET runs_completed = runs_completed + 1 WHERE id = ?').bind(booking.runner_id));
+    }
+    await db.batch(stmts);
+    const updated = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    return json({ booking: updated });
+  }
+
+  // ----- runner job board -----
+  if (method === 'GET' && path === '/api/jobs') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const rid = await runnerIdForUser(db, a.user.id);
+    if (!rid) return err(404, 'Runner profile not found.');
+    const jobs = await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? AND b.status = 'pending' ORDER BY b.created_at DESC, b.id DESC`, [rid]);
+    return json({ jobs });
+  }
+
+  const acceptMatch = path.match(/^\/api\/bookings\/(\d+)\/accept$/);
+  if (method === 'POST' && acceptMatch) {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const v = vId(acceptMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const booking = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    if (!booking) return err(404, 'Booking not found.');
+    const rid = await runnerIdForUser(db, a.user.id);
+    if (booking.status !== 'pending' || !rid || booking.runner_id !== rid) {
+      return err(409, 'Only pending bookings assigned to you can be accepted.');
+    }
+    await db.prepare("UPDATE bookings SET status = 'accepted', updated_at = datetime('now') WHERE id = ?").bind(v.value).run();
+    const updated = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    return json({ booking: updated });
+  }
+
+  const statusMatch = path.match(/^\/api\/bookings\/(\d+)\/status$/);
+  if (method === 'PATCH' && statusMatch) {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const v = vId(statusMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const status = body?.status;
+    if (!['en_route', 'delivered'].includes(status)) {
+      return validationErr(['status: Must be en_route or delivered.']);
+    }
+    const booking = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    if (!booking) return err(404, 'Booking not found.');
+    const rid = await runnerIdForUser(db, a.user.id);
+    if (!rid || booking.runner_id !== rid) return err(403, 'This booking is not assigned to you.');
+    const allowed = (TRANSITIONS.runner || {})[booking.status] || [];
+    if (!allowed.includes(status)) {
+      return err(409, `Cannot move booking from "${booking.status}" to "${status}" as runner.`);
+    }
+    const stmts = [db.prepare("UPDATE bookings SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, v.value)];
+    if (status === 'delivered') {
+      stmts.push(db.prepare('UPDATE runners SET runs_completed = runs_completed + 1 WHERE id = ?').bind(booking.runner_id));
+    }
+    await db.batch(stmts);
+    const updated = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [v.value]);
+    return json({ booking: updated });
+  }
+
+  if (method === 'GET' && path === '/api/runner/jobs') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const rid = await runnerIdForUser(db, a.user.id);
+    const rows = rid ? await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.runner_id = ? ORDER BY b.created_at DESC, b.id DESC`, [rid]) : [];
+    return json({ bookings: rows });
+  }
+
+  if (method === 'GET' && path === '/api/runner/earnings') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'runner');
+    if (rg) return rg;
+    const rid = await runnerIdForUser(db, a.user.id);
+    const rows = rid ? await qAll(db, `
+      SELECT b.id AS booking_id, s.title AS service_title, b.price_pula, b.updated_at AS delivered_at
+      FROM bookings b JOIN services s ON s.id = b.service_id
+      WHERE b.runner_id = ? AND b.status = 'delivered'
+      ORDER BY b.updated_at DESC, b.id DESC`, [rid]) : [];
+    const total = rows.reduce((sum, r) => sum + (Number(r.price_pula) || 0), 0);
+    return json({ total_pula: Math.round(total * 100) / 100, job_count: rows.length, earnings: rows });
+  }
+
+  // ----- reviews -----
+  if (method === 'POST' && path === '/api/reviews') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'customer');
+    if (rg) return rg;
+    const d = [];
+    const booking_id = body?.booking_id;
+    if (!Number.isInteger(booking_id) || booking_id <= 0) d.push('booking_id: Must be a positive integer.');
+    const rating = body?.rating;
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) d.push('rating: Must be an integer between 1 and 5.');
+    const comment = typeof body?.comment === 'string' ? body.comment.trim() : '';
+    if (comment.length > 500) d.push('comment: Too long.');
+    if (d.length) return validationErr(d);
+    const booking = await qOne(db, 'SELECT * FROM bookings WHERE id = ?', [booking_id]);
+    if (!booking || booking.customer_id !== a.user.id) return err(404, 'Booking not found.');
+    if (booking.status !== 'delivered') return err(409, 'You can only review delivered bookings.');
+    const existing = await qOne(db, 'SELECT id FROM reviews WHERE booking_id = ?', [booking_id]);
+    if (existing) return err(409, 'This booking already has a review.');
+    const ins = await db.prepare('INSERT INTO reviews (booking_id, reviewer_id, runner_id, rating, comment) VALUES (?, ?, ?, ?, ?)').bind(booking_id, a.user.id, booking.runner_id, rating, comment).run();
+    const reviewId = ins.meta.last_row_id;
+    const agg = await qOne(db, 'SELECT AVG(rating) AS avg_rating FROM reviews WHERE runner_id = ?', [booking.runner_id]);
+    await db.prepare('UPDATE runners SET rating = ROUND(?, 1) WHERE id = ?').bind(agg.avg_rating, booking.runner_id).run();
+    const review = await qOne(db, 'SELECT * FROM reviews WHERE id = ?', [reviewId]);
+    return json({ review }, 201);
+  }
+
+  // ----- leaderboard & zones -----
+  if (method === 'GET' && path === '/api/leaderboard') {
+    const rows = await qAll(db, `
+      SELECT id, display_name, vehicle, zone, rating, runs_completed, verified,
+             ROUND(rating * runs_completed, 1) AS score
+      FROM runners ORDER BY score DESC, rating DESC LIMIT 10`);
+    return json({ leaderboard: rows });
+  }
+
+  if (method === 'GET' && path === '/api/zones') {
+    const rows = await qAll(db, 'SELECT * FROM zones ORDER BY demand DESC');
+    return json({ zones: rows });
+  }
+
+  // ----- admin -----
+  if (method === 'GET' && path === '/api/admin/stats') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const users = await qOne(db, `
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN role = 'customer' THEN 1 ELSE 0 END) AS customers,
+             SUM(CASE WHEN role = 'runner' THEN 1 ELSE 0 END) AS runners,
+             SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admins
+      FROM users`);
+    const statusRows = await qAll(db, 'SELECT status, COUNT(*) AS c FROM bookings GROUP BY status');
+    const bookings_by_status = { pending: 0, accepted: 0, en_route: 0, delivered: 0, cancelled: 0 };
+    for (const r of statusRows) {
+      if (r.status in bookings_by_status) bookings_by_status[r.status] = r.c;
+    }
+    const rev = await qOne(db, "SELECT COALESCE(SUM(price_pula), 0) AS total FROM bookings WHERE status = 'delivered'");
+    const rc = await qOne(db, 'SELECT COUNT(*) AS c FROM reviews');
+    return json({
+      users: {
+        total: users.total || 0,
+        customers: users.customers || 0,
+        runners: users.runners || 0,
+        admins: users.admins || 0,
+      },
+      bookings_by_status,
+      total_revenue_pula: rev.total || 0,
+      pending_reviews: rc.c || 0,
+    });
+  }
+
+  if (method === 'GET' && path === '/api/admin/users') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const role = url.searchParams.get('role');
+    if (role && !['customer', 'runner', 'admin'].includes(role)) {
+      return validationErr(['role: Invalid role.']);
+    }
+    const rows = role
+      ? await qAll(db, 'SELECT * FROM users WHERE role = ? ORDER BY created_at DESC, id DESC', [role])
+      : await qAll(db, 'SELECT * FROM users ORDER BY created_at DESC, id DESC');
+    const users = [];
+    for (const row of rows) {
+      let verified;
+      if (row.role === 'runner') {
+        const r = await qOne(db, 'SELECT verified FROM runners WHERE user_id = ?', [row.id]);
+        verified = r?.verified;
+      }
+      users.push(adminSafeUser(row, verified));
+    }
+    return json({ users });
+  }
+
+  const adminUserMatch = path.match(/^\/api\/admin\/users\/(\d+)$/);
+  if (method === 'PATCH' && adminUserMatch) {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const v = vId(adminUserMatch[1]);
+    if (!v.ok) return validationErr(v.details);
+    const d = [];
+    const updates = {};
+    if (body?.role !== undefined) {
+      if (!ROLES.includes(body.role)) d.push('role: Invalid role.');
+      else updates.role = body.role;
+    }
+    if (body?.suspended !== undefined) {
+      if (typeof body.suspended !== 'boolean') d.push('suspended: Must be a boolean.');
+      else updates.suspended = body.suspended;
+    }
+    if (body?.verified !== undefined) {
+      if (typeof body.verified !== 'boolean') d.push('verified: Must be a boolean.');
+      else updates.verified = body.verified;
+    }
+    if (d.length) return validationErr(d);
+    const target = await qOne(db, 'SELECT * FROM users WHERE id = ?', [v.value]);
+    if (!target) return err(404, 'User not found.');
+    const isSelf = target.id === a.user.id;
+    if (isSelf && updates.suspended === true) return err(403, 'You cannot suspend your own account.');
+    if (isSelf && updates.role && updates.role !== target.role) {
+      return err(403, 'You cannot change your own role.');
+    }
+    const stmts = [];
+    if (updates.role && updates.role !== target.role) {
+      stmts.push(db.prepare('UPDATE users SET role = ? WHERE id = ?').bind(updates.role, v.value));
+      if (updates.role === 'runner') {
+        const hasProfile = await qOne(db, 'SELECT id FROM runners WHERE user_id = ?', [v.value]);
+        if (!hasProfile) {
+          stmts.push(
+            db.prepare(`INSERT INTO runners (user_id, display_name, vehicle, zone, rating, runs_completed, verified) VALUES (?, ?, 'car', 'CBD / Main Mall', 5.0, 0, 0)`).bind(v.value, target.name)
+          );
+        }
+      }
+    }
+    if (typeof updates.suspended === 'boolean') {
+      stmts.push(db.prepare('UPDATE users SET suspended = ? WHERE id = ?').bind(updates.suspended ? 1 : 0, v.value));
+    }
+    if (typeof updates.verified === 'boolean') {
+      stmts.push(db.prepare('UPDATE runners SET verified = ? WHERE user_id = ?').bind(updates.verified ? 1 : 0, v.value));
+    }
+    if (stmts.length) await db.batch(stmts);
+    const fresh = await qOne(db, 'SELECT * FROM users WHERE id = ?', [v.value]);
+    let verified;
+    if (fresh.role === 'runner') {
+      const r = await qOne(db, 'SELECT verified FROM runners WHERE user_id = ?', [v.value]);
+      verified = r?.verified;
+    }
+    return json({ user: adminSafeUser(fresh, verified) });
+  }
+
+  if (method === 'GET' && path === '/api/admin/bookings') {
+    const a = await requireAuth();
+    if (a.error) return a.error;
+    const rg = requireRole(a.user, 'admin');
+    if (rg) return rg;
+    const status = url.searchParams.get('status');
+    if (status && !BOOKING_STATUSES.includes(status)) {
+      return validationErr(['status: Invalid status.']);
+    }
+    const rows = status
+      ? await qAll(db, `${ENRICHED_BOOKING_SQL} WHERE b.status = ? ORDER BY b.created_at DESC, b.id DESC`, [status])
+      : await qAll(db, `${ENRICHED_BOOKING_SQL} ORDER BY b.created_at DESC, b.id DESC`);
+    return json({ bookings: rows });
+  }
+
+  return err(404, 'Not found.');
+}
+
+export default {
+  async fetch(req, env) {
+    try {
+      return await handle(req, env);
+    } catch (e) {
+      // Never leak stack traces to clients.
+      return json({ error: 'Internal server error.' }, 500);
+    }
+  },
+};
