@@ -14,3 +14,5 @@ local.properties
 *.db-shm
 npm-debug.log*
 build-tmp/
+
+.wrangler/
